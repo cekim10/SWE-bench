@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://state-ownership.local/schema/semantic_state_trace.schema.json",
+  "title": "Semantic State Trace Event",
+  "description": "One JSON object per line. Events are ordered by non-decreasing logical time `ts`.",
+  "type": "object",
+  "required": ["ts", "op"],
+  "properties": {
+    "ts": {"type": "integer", "minimum": 0},
+    "workflow_id": {"type": "string"},
+    "tenant_id": {"type": "string"},
+    "op": {
+      "type": "string",
+      "enum": ["CREATE", "READ", "DERIVE", "SHARE", "SUPERSEDE", "RELEASE", "MATERIALIZE", "EVICT", "RELOAD"]
+    },
+    "state_id": {"type": "string"},
+    "logical_key": {"type": "string"},
+    "state_type": {
+      "type": "string",
+      "enum": [
+        "agent_anchor",
+        "conversation_history",
+        "plan",
+        "tool_input",
+        "tool_output",
+        "retrieved_document",
+        "generated_artifact",
+        "error_diagnostic",
+        "summary",
+        "verification_result",
+        "scratch"
+      ]
+    },
+    "size_bytes": {"type": "integer", "minimum": 1},
+    "token_count": {"type": "integer", "minimum": 1},
+    "size_tokens": {"type": "integer", "minimum": 1, "description": "Deprecated alias for token_count."},
+    "recompute_cost": {"type": "number", "minimum": 0},
+    "reload_cost": {"type": "number", "minimum": 0},
+    "producer": {"type": "string"},
+    "consumer": {"type": "string"},
+    "owner_scope": {
+      "type": "string",
+      "enum": ["invocation", "agent", "workflow", "tenant", "shared"]
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["invocation", "agent", "workflow", "tenant", "shared"],
+      "description": "Alias for owner_scope."
+    },
+    "version": {"type": "integer", "minimum": 1},
+    "parent_state_ids": {"type": "array", "items": {"type": "string"}},
+    "supersedes": {"type": "string"},
+    "materialization": {"type": "string", "enum": ["HBM", "CPU", "DISK", "NONE"]},
+    "tier": {"type": "string", "enum": ["HBM", "CPU", "DISK", "NONE"]},
+    "from_tier": {"type": "string", "enum": ["HBM", "CPU", "DISK", "NONE"]},
+    "to_tier": {"type": "string", "enum": ["HBM", "CPU", "DISK", "NONE"]},
+    "old_state_id": {"type": "string"},
+    "new_state_id": {"type": "string"},
+    "metadata": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"op": {"const": "CREATE"}}},
+      "then": {
+        "required": [
+          "state_id",
+          "logical_key",
+          "state_type",
+          "size_bytes",
+          "token_count",
+          "producer",
+          "owner_scope",
+          "workflow_id",
+          "tenant_id",
+          "recompute_cost"
+        ]
+      }
+    },
+    {
+      "if": {"properties": {"op": {"const": "READ"}}},
+      "then": {"required": ["state_id", "consumer"]}
+    },
+    {
+      "if": {"properties": {"op": {"const": "DERIVE"}}},
+      "then": {
+        "required": [
+          "state_id",
+          "logical_key",
+          "state_type",
+          "size_bytes",
+          "token_count",
+          "producer",
+          "owner_scope",
+          "workflow_id",
+          "tenant_id",
+          "recompute_cost",
+          "parent_state_ids"
+        ]
+      }
+    },
+    {
+      "if": {"properties": {"op": {"const": "SHARE"}}},
+      "then": {"required": ["state_id", "consumer"]}
+    },
+    {
+      "if": {"properties": {"op": {"const": "SUPERSEDE"}}},
+      "then": {"required": ["old_state_id", "new_state_id"]}
+    },
+    {
+      "if": {"properties": {"op": {"const": "RELEASE"}}},
+      "then": {"required": ["state_id", "consumer"]}
+    },
+    {
+      "if": {"properties": {"op": {"const": "MATERIALIZE"}}},
+      "then": {"required": ["state_id", "tier"]}
+    },
+    {
+      "if": {"properties": {"op": {"const": "EVICT"}}},
+      "then": {"required": ["state_id"]}
+    },
+    {
+      "if": {"properties": {"op": {"const": "RELOAD"}}},
+      "then": {"required": ["state_id", "from_tier", "to_tier"]}
+    }
+  ],
+  "additionalProperties": true
+}
