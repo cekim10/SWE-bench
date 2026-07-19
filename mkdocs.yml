@@ -63,6 +63,7 @@ nav:
     - "Docker Setup": guides/docker_setup.md
     - "Datasets": guides/datasets.md
     - "Create RAG Datasets": guides/create_rag_datasets.md
+    - "Semantic State Tracing": guides/semantic_state_tracing.md
     - "Reference":
       - "The Harness": reference/harness.md
       - "Inference": reference/inference.md

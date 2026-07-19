@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Protocol
 
-from swebench.inference.runtime.segment_materializer import VLLMSegmentRequest
+from swebench.inference.runtime.segment_materializer import SegmentedGenerationRequest
 
 
 @dataclass(frozen=True)
@@ -13,7 +13,7 @@ class VLLMBackendRequest:
     user_prompt: str
     temperature: float = 0.0
     prompt_mode: str = "monolithic"
-    segment_request: VLLMSegmentRequest | None = None
+    segment_request: SegmentedGenerationRequest | None = None
     extra_body: Dict[str, object] = field(default_factory=dict)
 
     def to_messages(self) -> list[dict[str, str]]:

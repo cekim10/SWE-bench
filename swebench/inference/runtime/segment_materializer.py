@@ -18,7 +18,7 @@ class SegmentIdentity:
 
 
 @dataclass
-class SegmentVersion:
+class ContextSegment:
     state_id: str
     identity: SegmentIdentity
     version: int
@@ -37,7 +37,7 @@ class SegmentVersion:
 
 
 @dataclass(frozen=True)
-class MaterializationGroup:
+class ContextSegmentGroup:
     group_id: str
     workflow_id: str
     consumer: str
@@ -46,7 +46,7 @@ class MaterializationGroup:
 
 
 @dataclass(frozen=True)
-class ResidencySnapshot:
+class RuntimeResidencySnapshot:
     segment_tiers: Dict[str, ResidencyTier]
     access_counts: Dict[str, int]
     hbm_bytes: int
@@ -54,7 +54,7 @@ class ResidencySnapshot:
 
 
 @dataclass(frozen=True)
-class ResidencyDecision:
+class RuntimePlacementDecision:
     pin_in_hbm: tuple[str, ...] = ()
     offload_to_cpu: tuple[str, ...] = ()
     evict: tuple[str, ...] = ()
@@ -62,8 +62,8 @@ class ResidencyDecision:
 
 
 @dataclass(frozen=True)
-class VLLMSegmentRequest:
-    ordered_segments: tuple[SegmentVersion, ...]
+class SegmentedGenerationRequest:
+    ordered_segments: tuple[ContextSegment, ...]
     enable_prefix_caching: bool = True
 
     def assembled_prompt(self, separator: str = "\n\n") -> str:
@@ -97,7 +97,7 @@ class VLLMSegmentRequest:
         return messages
 
 
-class WeakHeuristicSegmentPolicy:
+class ReuseAwareRuntimePolicy:
     """Minimal online policy so the abstraction is evaluable without a predictor."""
 
     def __init__(self, *, ephemeral_offload_after_reads: int = 1) -> None:
@@ -106,48 +106,52 @@ class WeakHeuristicSegmentPolicy:
     def decide(
         self,
         *,
-        materializer: "SegmentMaterializer",
-        group: MaterializationGroup,
-    ) -> ResidencyDecision:
+        runtime: "SegmentRuntime" | None = None,
+        materializer: "SegmentRuntime" | None = None,
+        group: ContextSegmentGroup,
+    ) -> RuntimePlacementDecision:
+        runtime = runtime or materializer
+        if runtime is None:
+            raise ValueError("runtime or materializer is required")
         pin_in_hbm = []
         offload_to_cpu = []
         rematerialize_for_read = []
         active_ids = set(group.ordered_segment_ids)
 
         for state_id in group.ordered_segment_ids:
-            segment = materializer.get_segment(state_id)
-            tier = materializer.tier_for(state_id)
+            segment = runtime.get_segment(state_id)
+            tier = runtime.tier_for(state_id)
             if tier == ResidencyTier.EVICTED:
                 rematerialize_for_read.append(state_id)
             if segment.is_shared or segment.is_immutable or not segment.is_ephemeral:
                 pin_in_hbm.append(state_id)
 
-        for state_id, segment in materializer.iter_segments():
+        for state_id, segment in runtime.iter_segments():
             if state_id in active_ids:
                 continue
-            if materializer.tier_for(state_id) != ResidencyTier.HBM:
+            if runtime.tier_for(state_id) != ResidencyTier.HBM:
                 continue
-            if segment.is_ephemeral and materializer.access_count(state_id) >= self.ephemeral_offload_after_reads:
+            if segment.is_ephemeral and runtime.access_count(state_id) >= self.ephemeral_offload_after_reads:
                 offload_to_cpu.append(state_id)
 
-        return ResidencyDecision(
+        return RuntimePlacementDecision(
             pin_in_hbm=tuple(dict.fromkeys(pin_in_hbm)),
             offload_to_cpu=tuple(dict.fromkeys(offload_to_cpu)),
             rematerialize_for_read=tuple(dict.fromkeys(rematerialize_for_read)),
         )
 
 
-class SegmentMaterializer:
-    """Runtime boundary for segment-granular materialization independent of model backend."""
+class SegmentRuntime:
+    """Thin runtime layer that exposes segment-level materialization above a serving backend."""
 
     def __init__(self) -> None:
-        self._segments: Dict[str, SegmentVersion] = {}
+        self._segments: Dict[str, ContextSegment] = {}
         self._tiers: Dict[str, ResidencyTier] = {}
         self._access_counts: Dict[str, int] = {}
 
     def register_segment(
         self,
-        segment: SegmentVersion,
+        segment: ContextSegment,
         *,
         initial_tier: ResidencyTier | None = None,
     ) -> None:
@@ -169,8 +173,8 @@ class SegmentMaterializer:
         consumer: str,
         ordered_segment_ids: Sequence[str],
         prompt_id: str | None = None,
-    ) -> MaterializationGroup:
-        return MaterializationGroup(
+    ) -> ContextSegmentGroup:
+        return ContextSegmentGroup(
             group_id=group_id,
             workflow_id=workflow_id,
             consumer=consumer,
@@ -178,10 +182,10 @@ class SegmentMaterializer:
             prompt_id=prompt_id,
         )
 
-    def get_segment(self, state_id: str) -> SegmentVersion:
+    def get_segment(self, state_id: str) -> ContextSegment:
         return self._segments[state_id]
 
-    def iter_segments(self) -> Iterable[tuple[str, SegmentVersion]]:
+    def iter_segments(self) -> Iterable[tuple[str, ContextSegment]]:
         return self._segments.items()
 
     def tier_for(self, state_id: str) -> ResidencyTier:
@@ -196,7 +200,7 @@ class SegmentMaterializer:
             if self.tier_for(state_id) == ResidencyTier.EVICTED:
                 self._tiers[state_id] = ResidencyTier.CPU
 
-    def apply_decision(self, decision: ResidencyDecision) -> None:
+    def apply_decision(self, decision: RuntimePlacementDecision) -> None:
         for state_id in decision.pin_in_hbm:
             self._tiers[state_id] = ResidencyTier.HBM
         for state_id in decision.offload_to_cpu:
@@ -209,24 +213,24 @@ class SegmentMaterializer:
 
     def prepare_group_read(
         self,
-        group: MaterializationGroup,
+        group: ContextSegmentGroup,
         *,
-        policy: WeakHeuristicSegmentPolicy | None = None,
-    ) -> ResidencyDecision:
-        policy = policy or WeakHeuristicSegmentPolicy()
-        decision = policy.decide(materializer=self, group=group)
+        policy: ReuseAwareRuntimePolicy | None = None,
+    ) -> RuntimePlacementDecision:
+        policy = policy or ReuseAwareRuntimePolicy()
+        decision = policy.decide(runtime=self, group=group)
         self.apply_decision(decision)
         self.record_read(group.ordered_segment_ids)
         return decision
 
-    def build_vllm_request(self, group: MaterializationGroup) -> VLLMSegmentRequest:
-        return VLLMSegmentRequest(
+    def build_vllm_request(self, group: ContextSegmentGroup) -> SegmentedGenerationRequest:
+        return SegmentedGenerationRequest(
             ordered_segments=tuple(
                 self.get_segment(state_id) for state_id in group.ordered_segment_ids
             )
         )
 
-    def snapshot(self) -> ResidencySnapshot:
+    def snapshot(self) -> RuntimeResidencySnapshot:
         hbm_bytes = 0
         cpu_bytes = 0
         for state_id, segment in self._segments.items():
@@ -235,9 +239,20 @@ class SegmentMaterializer:
                 hbm_bytes += segment.size_bytes
             elif tier == ResidencyTier.CPU:
                 cpu_bytes += segment.size_bytes
-        return ResidencySnapshot(
+        return RuntimeResidencySnapshot(
             segment_tiers=dict(self._tiers),
             access_counts=dict(self._access_counts),
             hbm_bytes=hbm_bytes,
             cpu_bytes=cpu_bytes,
         )
+
+
+# Backward-compatible aliases for earlier prototype names.
+SegmentVersion = ContextSegment
+MaterializationGroup = ContextSegmentGroup
+ResidencySnapshot = RuntimeResidencySnapshot
+ResidencyDecision = RuntimePlacementDecision
+VLLMSegmentRequest = SegmentedGenerationRequest
+WeakHeuristicSegmentPolicy = ReuseAwareRuntimePolicy
+SegmentMaterializer = SegmentRuntime
+SegmentRegistry = SegmentRuntime

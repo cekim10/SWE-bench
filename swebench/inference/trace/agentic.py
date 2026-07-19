@@ -10,13 +10,13 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Protocol, Sequence, TypedDict
 
 from swebench.inference.runtime.segment_materializer import (
-    MaterializationGroup,
-    ResidencySnapshot,
+    ContextSegment,
+    ContextSegmentGroup,
     ResidencyTier,
+    RuntimeResidencySnapshot,
     SegmentIdentity,
-    SegmentMaterializer,
-    SegmentVersion,
-    VLLMSegmentRequest,
+    SegmentRuntime,
+    SegmentedGenerationRequest,
 )
 from swebench.inference.runtime.vllm_adapter import (
     OpenAICompatibleVLLMAdapter,
@@ -183,9 +183,9 @@ class ModelBackend(Protocol):
         iteration: int,
         instance: WorkflowInstance,
         prompt_mode: str = "monolithic",
-        prompt_group: MaterializationGroup | None = None,
-        segment_request: VLLMSegmentRequest | None = None,
-        materializer_snapshot: ResidencySnapshot | None = None,
+        prompt_group: ContextSegmentGroup | None = None,
+        segment_request: SegmentedGenerationRequest | None = None,
+        materializer_snapshot: RuntimeResidencySnapshot | None = None,
     ) -> str:
         ...
 
@@ -202,9 +202,9 @@ class StubModelBackend:
         iteration: int,
         instance: WorkflowInstance,
         prompt_mode: str = "monolithic",
-        prompt_group: MaterializationGroup | None = None,
-        segment_request: VLLMSegmentRequest | None = None,
-        materializer_snapshot: ResidencySnapshot | None = None,
+        prompt_group: ContextSegmentGroup | None = None,
+        segment_request: SegmentedGenerationRequest | None = None,
+        materializer_snapshot: RuntimeResidencySnapshot | None = None,
     ) -> str:
         if step_name == "planner":
             return (
@@ -312,9 +312,9 @@ class OpenAICompatibleChatBackend:
         iteration: int,
         instance: WorkflowInstance,
         prompt_mode: str = "monolithic",
-        prompt_group: MaterializationGroup | None = None,
-        segment_request: VLLMSegmentRequest | None = None,
-        materializer_snapshot: ResidencySnapshot | None = None,
+        prompt_group: ContextSegmentGroup | None = None,
+        segment_request: SegmentedGenerationRequest | None = None,
+        materializer_snapshot: RuntimeResidencySnapshot | None = None,
     ) -> str:
         client, mode = self._client()
         messages = [
@@ -365,9 +365,9 @@ class VLLMServerChatBackend:
         iteration: int,
         instance: WorkflowInstance,
         prompt_mode: str = "monolithic",
-        prompt_group: MaterializationGroup | None = None,
-        segment_request: VLLMSegmentRequest | None = None,
-        materializer_snapshot: ResidencySnapshot | None = None,
+        prompt_group: ContextSegmentGroup | None = None,
+        segment_request: SegmentedGenerationRequest | None = None,
+        materializer_snapshot: RuntimeResidencySnapshot | None = None,
     ) -> str:
         request = VLLMBackendRequest(
             model=self.model,
@@ -477,9 +477,9 @@ class AnthropicMessagesBackend:
         iteration: int,
         instance: WorkflowInstance,
         prompt_mode: str = "monolithic",
-        prompt_group: MaterializationGroup | None = None,
-        segment_request: VLLMSegmentRequest | None = None,
-        materializer_snapshot: ResidencySnapshot | None = None,
+        prompt_group: ContextSegmentGroup | None = None,
+        segment_request: SegmentedGenerationRequest | None = None,
+        materializer_snapshot: RuntimeResidencySnapshot | None = None,
     ) -> str:
         try:
             from anthropic import Anthropic
@@ -647,7 +647,7 @@ class TracedAgentRunner:
     def _register_runtime_segment(
         self,
         *,
-        materializer: SegmentMaterializer,
+        materializer: SegmentRuntime,
         handle,
         workflow_id: str,
         module: str,
@@ -659,7 +659,7 @@ class TracedAgentRunner:
         is_ephemeral: bool,
         metadata: Mapping[str, object] | None = None,
     ) -> None:
-        segment = SegmentVersion(
+        segment = ContextSegment(
             state_id=handle.state_id,
             identity=SegmentIdentity(logical_key=handle.logical_key, module=module),
             version=handle.version,
@@ -680,7 +680,7 @@ class TracedAgentRunner:
     def _release_runtime_segment(
         self,
         *,
-        materializer: SegmentMaterializer,
+        materializer: SegmentRuntime,
         state_id: str | None,
     ) -> None:
         if state_id is None:
@@ -690,14 +690,14 @@ class TracedAgentRunner:
     def _prepare_segmented_prompt(
         self,
         *,
-        materializer: SegmentMaterializer,
+        materializer: SegmentRuntime,
         trace: TraceLogger,
         workflow_id: str,
         consumer: str,
         prompt_id: str,
         segments: Sequence[Mapping[str, object]],
         metadata: Mapping[str, object] | None = None,
-    ) -> tuple[MaterializationGroup, VLLMSegmentRequest, ResidencySnapshot]:
+    ) -> tuple[ContextSegmentGroup, SegmentedGenerationRequest, RuntimeResidencySnapshot]:
         group = materializer.build_group(
             group_id=prompt_id,
             workflow_id=workflow_id,
@@ -724,7 +724,7 @@ class TracedAgentRunner:
     def _prepare_langgraph_prompt_runtime(
         self,
         *,
-        materializer: SegmentMaterializer,
+        materializer: SegmentRuntime,
         trace: TraceLogger,
         workflow_id: str,
         consumer: str,
@@ -733,9 +733,9 @@ class TracedAgentRunner:
         metadata: Mapping[str, object] | None = None,
     ) -> tuple[
         str,
-        MaterializationGroup | None,
-        VLLMSegmentRequest | None,
-        ResidencySnapshot | None,
+        ContextSegmentGroup | None,
+        SegmentedGenerationRequest | None,
+        RuntimeResidencySnapshot | None,
     ]:
         if self.prompt_runtime_mode == "segment_aware":
             group, request, snapshot = self._prepare_segmented_prompt(
@@ -1728,7 +1728,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             workflow_id=instance.instance_id,
             tenant_id=self.tenant_id,
         ) as trace:
-            materializer = SegmentMaterializer()
+            materializer = SegmentRuntime()
             system_prompt = self._system_prompt_text()
             system_state = trace.create_state(
                 state_id="system_v1",
