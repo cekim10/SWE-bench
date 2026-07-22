@@ -454,6 +454,29 @@ class VLLMServerChatBackend:
         )
         return self.adapter.complete(request)
 
+    @property
+    def runtime_model_id(self) -> str:
+        return self.model
+
+    @property
+    def runtime_tokenizer_id(self) -> str:
+        return self.model
+
+    def runtime_inference_config(
+        self,
+        *,
+        step_name: str,
+        prompt_mode: str,
+    ) -> Mapping[str, object]:
+        return {
+            "provider": self.name,
+            "step_name": step_name,
+            "prompt_mode": prompt_mode,
+            "temperature": self.temperature,
+            "transport": "openai-compatible-vllm",
+            "apc_enabled": True,
+        }
+
 
 class OpenAIChatBackend(OpenAICompatibleChatBackend):
     name = "openai"
