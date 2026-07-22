@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 import importlib.util
 import math
@@ -174,6 +175,8 @@ def build_demo_instance() -> WorkflowInstance:
 
 
 class ModelBackend(Protocol):
+    name: str
+
     def complete(
         self,
         *,
@@ -187,6 +190,22 @@ class ModelBackend(Protocol):
         segment_request: SegmentedGenerationRequest | None = None,
         materializer_snapshot: RuntimeResidencySnapshot | None = None,
     ) -> str:
+        ...
+
+    @property
+    def runtime_model_id(self) -> str:
+        ...
+
+    @property
+    def runtime_tokenizer_id(self) -> str:
+        ...
+
+    def runtime_inference_config(
+        self,
+        *,
+        step_name: str,
+        prompt_mode: str,
+    ) -> Mapping[str, object]:
         ...
 
 
@@ -247,8 +266,29 @@ class StubModelBackend:
                 "Review v2:\n"
                 "- Patch matches the stated invariant.\n"
                 "- No additional changes required before verification.\n"
-            )
+        )
         raise ValueError(f"unknown step_name {step_name!r}")
+
+    @property
+    def runtime_model_id(self) -> str:
+        return "stub"
+
+    @property
+    def runtime_tokenizer_id(self) -> str:
+        return "stub"
+
+    def runtime_inference_config(
+        self,
+        *,
+        step_name: str,
+        prompt_mode: str,
+    ) -> Mapping[str, object]:
+        return {
+            "provider": self.name,
+            "step_name": step_name,
+            "prompt_mode": prompt_mode,
+            "temperature": 0.0,
+        }
 
 
 class OpenAICompatibleChatBackend:
@@ -334,6 +374,27 @@ class OpenAICompatibleChatBackend:
             temperature=self.temperature,
         )
         return response.choices[0].message.content or ""
+
+    @property
+    def runtime_model_id(self) -> str:
+        return self.model
+
+    @property
+    def runtime_tokenizer_id(self) -> str:
+        return self.model
+
+    def runtime_inference_config(
+        self,
+        *,
+        step_name: str,
+        prompt_mode: str,
+    ) -> Mapping[str, object]:
+        return {
+            "provider": self.name,
+            "step_name": step_name,
+            "prompt_mode": prompt_mode,
+            "temperature": self.temperature,
+        }
 
 
 class VLLMServerChatBackend:
@@ -496,6 +557,28 @@ class AnthropicMessagesBackend:
         )
         text_blocks = [block.text for block in response.content if hasattr(block, "text")]
         return "\n".join(text_blocks)
+
+    @property
+    def runtime_model_id(self) -> str:
+        return self.model
+
+    @property
+    def runtime_tokenizer_id(self) -> str:
+        return self.model
+
+    def runtime_inference_config(
+        self,
+        *,
+        step_name: str,
+        prompt_mode: str,
+    ) -> Mapping[str, object]:
+        return {
+            "provider": self.name,
+            "step_name": step_name,
+            "prompt_mode": prompt_mode,
+            "temperature": self.temperature,
+            "max_tokens": 1024,
+        }
 
 
 def make_backend(
@@ -694,6 +777,7 @@ class TracedAgentRunner:
         trace: TraceLogger,
         workflow_id: str,
         consumer: str,
+        step_name: str,
         prompt_id: str,
         segments: Sequence[Mapping[str, object]],
         metadata: Mapping[str, object] | None = None,
@@ -705,7 +789,15 @@ class TracedAgentRunner:
             ordered_segment_ids=[str(segment["state_id"]) for segment in segments],
             prompt_id=prompt_id,
         )
-        materializer.prepare_group_read(group)
+        materializer.prepare_group_read(
+            group,
+            model_id=self.backend.runtime_model_id,
+            tokenizer_id=self.backend.runtime_tokenizer_id,
+            inference_config=self.backend.runtime_inference_config(
+                step_name=step_name,
+                prompt_mode="segment_aware",
+            ),
+        )
         snapshot = materializer.snapshot()
         trace.log_prompt_segments(
             consumer=consumer,
@@ -715,6 +807,8 @@ class TracedAgentRunner:
                 **dict(metadata or {}),
                 "runtime_group_id": group.group_id,
                 "runtime_prompt_mode": "segment_aware",
+                "runtime_model_id": self.backend.runtime_model_id,
+                "runtime_tokenizer_id": self.backend.runtime_tokenizer_id,
                 "runtime_hbm_bytes": snapshot.hbm_bytes,
                 "runtime_cpu_bytes": snapshot.cpu_bytes,
             },
@@ -728,6 +822,7 @@ class TracedAgentRunner:
         trace: TraceLogger,
         workflow_id: str,
         consumer: str,
+        step_name: str,
         prompt_id: str,
         segments: Sequence[Mapping[str, object]],
         metadata: Mapping[str, object] | None = None,
@@ -743,6 +838,7 @@ class TracedAgentRunner:
                 trace=trace,
                 workflow_id=workflow_id,
                 consumer=consumer,
+                step_name=step_name,
                 prompt_id=prompt_id,
                 segments=segments,
                 metadata=metadata,
@@ -757,9 +853,23 @@ class TracedAgentRunner:
                 **dict(metadata or {}),
                 "runtime_group_id": prompt_id,
                 "runtime_prompt_mode": "monolithic",
+                "runtime_model_id": self.backend.runtime_model_id,
+                "runtime_tokenizer_id": self.backend.runtime_tokenizer_id,
             },
         )
         return "monolithic", None, None, None
+
+    def _runtime_event_summary(self, materializer: SegmentRuntime) -> Dict[str, object]:
+        events = materializer.events()
+        op_counts = Counter(event.operation for event in events)
+        lookup_status_counts = Counter(
+            event.lookup_status for event in events if event.lookup_status is not None
+        )
+        return {
+            "event_count": len(events),
+            "op_counts": dict(sorted(op_counts.items())),
+            "lookup_status_counts": dict(sorted(lookup_status_counts.items())),
+        }
 
     def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
         trace_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}.jsonl"
@@ -1885,6 +1995,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     trace=trace,
                     workflow_id=instance.instance_id,
                     consumer="router",
+                    step_name="router",
                     prompt_id=f"router-{iteration}",
                     segments=router_segments,
                     metadata={"hook": "router.messages_for_llm", "iteration": iteration},
@@ -1976,6 +2087,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     trace=trace,
                     workflow_id=instance.instance_id,
                     consumer="planner",
+                    step_name="planner",
                     prompt_id=f"planner-{iteration}",
                     segments=planner_segments,
                     metadata={"hook": "planner.messages_for_llm", "iteration": iteration},
@@ -2061,6 +2173,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     trace=trace,
                     workflow_id=instance.instance_id,
                     consumer="coder",
+                    step_name="coder",
                     prompt_id=f"coder-{iteration}",
                     segments=coder_segments,
                     metadata={"hook": "coder.messages_for_llm", "iteration": iteration},
@@ -2139,6 +2252,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     trace=trace,
                     workflow_id=instance.instance_id,
                     consumer="reviewer",
+                    step_name="reviewer",
                     prompt_id=f"reviewer-{iteration}",
                     segments=reviewer_segments,
                     metadata={"hook": "reviewer.messages_for_llm", "iteration": iteration},
@@ -2211,6 +2325,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     trace=trace,
                     workflow_id=instance.instance_id,
                     consumer="tester",
+                    step_name="tester",
                     prompt_id=f"tester-{iteration}",
                     segments=tester_segments,
                     metadata={"hook": "tester.messages_for_llm", "iteration": iteration},
@@ -2379,6 +2494,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
 
         events = load_trace_events(trace_path)
         validation = validate_trace_events(events)
+        runtime_summary = self._runtime_event_summary(materializer)
         return {
             "instance_id": instance.instance_id,
             "status": str(final_state.get("status", "UNRESOLVED")),
@@ -2389,6 +2505,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             "patch": str(final_state.get("final_patch_text", "")),
             "verification": str(final_state.get("final_verdict_text", "")),
             "trace_path": str(trace_path),
+            "runtime_event_summary": runtime_summary,
             "trace_validation": {
                 "is_valid": validation.is_valid,
                 "errors": validation.errors,

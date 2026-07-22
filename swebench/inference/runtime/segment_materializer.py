@@ -969,6 +969,9 @@ class SegmentRuntime:
         group: ContextSegmentGroup,
         *,
         policy: ReuseAwareRuntimePolicy | None = None,
+        model_id: str = "group-model",
+        tokenizer_id: str = "group-tokenizer",
+        inference_config: Mapping[str, object] | None = None,
     ) -> RuntimePlacementDecision:
         policy = policy or ReuseAwareRuntimePolicy()
         decision = policy.decide(runtime=self, group=group)
@@ -976,7 +979,13 @@ class SegmentRuntime:
         for state_id in group.ordered_segment_ids:
             lookup_result = self.lookup(
                 state_id,
-                self.execution_context_for_group(group=group, state_id=state_id),
+                self.execution_context_for_group(
+                    group=group,
+                    state_id=state_id,
+                    model_id=model_id,
+                    tokenizer_id=tokenizer_id,
+                    inference_config=inference_config,
+                ),
             )
             if isinstance(lookup_result, LookupResult) and lookup_result.status == LookupStatus.INVALID:
                 raise InvalidLookupError(
