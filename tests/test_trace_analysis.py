@@ -59,6 +59,7 @@ ANALYSIS = MODULES["swebench.inference.trace.analysis"]
 class TraceAnalysisTests(unittest.TestCase):
     def test_stub_trace_analysis_reports_modules_and_mismatch(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_event_path = Path(tmpdir) / "runtime.jsonl"
             runner = AGENTIC.TracedAgentRunner(
                 backend=AGENTIC.StubModelBackend(),
                 trace_dir=Path(tmpdir) / "traces",
@@ -67,7 +68,120 @@ class TraceAnalysisTests(unittest.TestCase):
                 max_files=2,
             )
             result = runner.run_instance(AGENTIC.build_demo_instance())
-            report = ANALYSIS.analyze_trace_paths([result["trace_path"]])
+            runtime_event_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "workflow_id": result["instance_id"],
+                                "segment_id": "system_v1",
+                                "logical_id": "prompt/system",
+                                "version": 1,
+                                "role": "system",
+                                "module": "system",
+                                "operation": "REGISTER",
+                                "timestamp": 0.0,
+                                "from_semantic_state": None,
+                                "to_semantic_state": "REGISTERED",
+                                "from_residency_state": None,
+                                "to_residency_state": "UNMATERIALIZED",
+                                "lookup_status": None,
+                                "execution_context_digest": None,
+                                "reason": None,
+                                "size_bytes": 10,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "workflow_id": result["instance_id"],
+                                "segment_id": "system_v1",
+                                "logical_id": "prompt/system",
+                                "version": 1,
+                                "role": "system",
+                                "module": "system",
+                                "operation": "MATERIALIZE_INTERNAL",
+                                "timestamp": 1.0,
+                                "from_semantic_state": "REGISTERED",
+                                "to_semantic_state": "REGISTERED",
+                                "from_residency_state": "UNMATERIALIZED",
+                                "to_residency_state": "RESIDENT",
+                                "lookup_status": "MISS",
+                                "execution_context_digest": "ctx-1",
+                                "reason": "first_materialization",
+                                "size_bytes": 10,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "workflow_id": result["instance_id"],
+                                "segment_id": "system_v1",
+                                "logical_id": "prompt/system",
+                                "version": 1,
+                                "role": "system",
+                                "module": "system",
+                                "operation": "REUSE",
+                                "timestamp": 2.0,
+                                "from_semantic_state": "REGISTERED",
+                                "to_semantic_state": "REGISTERED",
+                                "from_residency_state": "RESIDENT",
+                                "to_residency_state": "RESIDENT",
+                                "lookup_status": "HIT_RESIDENT",
+                                "execution_context_digest": "ctx-1",
+                                "reason": "exact_context_match",
+                                "size_bytes": 10,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "workflow_id": result["instance_id"],
+                                "segment_id": "system_v1",
+                                "logical_id": "prompt/system",
+                                "version": 1,
+                                "role": "system",
+                                "module": "system",
+                                "operation": "RECLAIM",
+                                "timestamp": 3.0,
+                                "from_semantic_state": "REGISTERED",
+                                "to_semantic_state": "REGISTERED",
+                                "from_residency_state": "RESIDENT",
+                                "to_residency_state": "EVICTED",
+                                "lookup_status": None,
+                                "execution_context_digest": "ctx-1",
+                                "reason": "release_reclamation",
+                                "size_bytes": 10,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "workflow_id": result["instance_id"],
+                                "segment_id": "system_v1",
+                                "logical_id": "prompt/system",
+                                "version": 1,
+                                "role": "system",
+                                "module": "system",
+                                "operation": "RELEASE",
+                                "timestamp": 4.0,
+                                "from_semantic_state": "REGISTERED",
+                                "to_semantic_state": "RELEASED",
+                                "from_residency_state": "RESIDENT",
+                                "to_residency_state": "EVICTED",
+                                "lookup_status": None,
+                                "execution_context_digest": None,
+                                "reason": "semantic_release",
+                                "size_bytes": 10,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = ANALYSIS.analyze_trace_paths(
+                [result["trace_path"]],
+                runtime_event_paths_by_trace_path={
+                    str(Path(result["trace_path"]).resolve()): str(runtime_event_path.resolve())
+                },
+            )
             aggregate = report["aggregate"]
 
             modules = {
@@ -140,6 +254,14 @@ class TraceAnalysisTests(unittest.TestCase):
             self.assertGreater(
                 aggregate["oracle_abstraction_bridge"]["oracle_rematerialization_savings_fraction"],
                 0.0,
+            )
+            self.assertIn("runtime_behavior", aggregate)
+            self.assertGreater(aggregate["runtime_behavior"]["event_count"], 0)
+            self.assertGreater(aggregate["runtime_behavior"]["materializations"], 0)
+            self.assertEqual(aggregate["runtime_behavior"]["policy_reclaims"], 0)
+            self.assertGreater(
+                len(aggregate["runtime_behavior"]["role_rows"]),
+                0,
             )
 
     def test_markdown_render_contains_sections(self):
@@ -218,6 +340,46 @@ class TraceAnalysisTests(unittest.TestCase):
                     "oracle_rematerialization_savings_fraction": 1.0,
                     "oracle_service_cost_savings_fraction": 1.0,
                 },
+                "runtime_behavior": {
+                    "event_count": 8,
+                    "resident_hit_rate": 0.25,
+                    "resident_hits": 1,
+                    "evicted_hits": 0,
+                    "misses": 3,
+                    "invalid_lookups": 0,
+                    "materializations": 3,
+                    "rematerializations": 1,
+                    "reuse_count": 1,
+                    "lifecycle_reclaims": 2,
+                    "policy_reclaims": 0,
+                    "bytes_reclaimed": 20,
+                    "role_rows": [
+                        {
+                            "role": "system",
+                            "registrations": 1,
+                            "resident_hits": 1,
+                            "misses": 1,
+                            "materializations": 1,
+                            "rematerializations": 0,
+                            "lifecycle_reclaims": 1,
+                            "policy_reclaims": 0,
+                            "registered_but_never_reused": 0,
+                            "reused_exactly_once": 1,
+                            "reused_more_than_five": 0,
+                            "resident_hit_rate": 0.5,
+                        }
+                    ],
+                    "lifetime_rows": [
+                        {
+                            "role": "system",
+                            "count": 1,
+                            "avg_semantic_lifetime": 10.0,
+                            "avg_registration_to_first_lookup": 1.0,
+                            "avg_lookup_span": 4.0,
+                            "registered_but_never_reused_ratio": 0.0,
+                        }
+                    ],
+                },
                 "abstraction_bridge": {
                     "transition_count": 1,
                     "monolithic_peak_hbm_bytes": 20,
@@ -248,6 +410,7 @@ class TraceAnalysisTests(unittest.TestCase):
                 "valid_trace_count": 1,
                 "invalid_instance_ids": [],
                 "missing_trace_path_count": 0,
+                "runtime_event_path_count": 1,
                 "real_backend_trace_count": 0,
                 "stub_trace_count": 1,
             },
@@ -271,6 +434,7 @@ class TraceAnalysisTests(unittest.TestCase):
         self.assertIn("## Lifetime Correlation Matrix", markdown)
         self.assertIn("## Abstraction Mismatch", markdown)
         self.assertIn("## Oracle Abstraction Bridge", markdown)
+        self.assertIn("## Practical Runtime", markdown)
         self.assertIn("offline oracle upper bound", markdown)
         self.assertIn("## Provider Breakdown", markdown)
         self.assertIn("Pinned live fraction", markdown)
@@ -282,7 +446,7 @@ class TraceAnalysisTests(unittest.TestCase):
             output_path.write_text(
                 "\n".join(
                     [
-                        '{"instance_id":"a","provider":"stub","trace_path":"/tmp/a.jsonl","trace_validation":{"is_valid":true}}',
+                        '{"instance_id":"a","provider":"stub","trace_path":"/tmp/a.jsonl","runtime_event_path":"/tmp/a_runtime.jsonl","trace_validation":{"is_valid":true}}',
                         '{"instance_id":"b","provider":"openai","trace_path":"/tmp/b.jsonl","trace_validation":{"is_valid":false}}',
                     ]
                 )
@@ -295,6 +459,7 @@ class TraceAnalysisTests(unittest.TestCase):
             self.assertEqual(summary["real_backend_trace_count"], 1)
             self.assertEqual(summary["valid_trace_count"], 1)
             self.assertEqual(summary["invalid_instance_ids"], ["b"])
+            self.assertEqual(summary["runtime_event_path_count"], 1)
 
     def test_discover_trace_paths_skips_missing_trace_paths(self):
         with tempfile.TemporaryDirectory() as tmpdir:

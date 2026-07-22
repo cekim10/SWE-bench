@@ -894,6 +894,40 @@ class TracedAgentRunner:
             "lookup_status_counts": dict(sorted(lookup_status_counts.items())),
         }
 
+    def _write_runtime_events(
+        self,
+        *,
+        materializer: SegmentRuntime,
+        runtime_event_path: Path,
+        workflow_id: str,
+        agent_family: str,
+    ) -> None:
+        runtime_event_path.parent.mkdir(parents=True, exist_ok=True)
+        with runtime_event_path.open("w", encoding="utf-8") as handle:
+            for event in materializer.events():
+                segment = materializer.get_segment(event.segment_id)
+                record = {
+                    "workflow_id": workflow_id,
+                    "segment_id": event.segment_id,
+                    "logical_id": event.logical_id,
+                    "version": event.version,
+                    "role": str(segment.role.value if hasattr(segment.role, "value") else segment.role),
+                    "module": segment.identity.module,
+                    "operation": event.operation,
+                    "timestamp": event.timestamp,
+                    "from_semantic_state": event.from_semantic_state,
+                    "to_semantic_state": event.to_semantic_state,
+                    "from_residency_state": event.from_residency_state,
+                    "to_residency_state": event.to_residency_state,
+                    "lookup_status": event.lookup_status,
+                    "execution_context_digest": event.execution_context_digest,
+                    "reason": event.reason,
+                    "size_bytes": event.size_bytes,
+                    "agent_family": agent_family,
+                    "provider": getattr(self.backend, "name", self.backend.__class__.__name__),
+                }
+                handle.write(json.dumps(record) + "\n")
+
     def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
         trace_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}.jsonl"
         selected_files = self._select_files(instance)
@@ -1854,6 +1888,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
         StateGraph, START, END = _load_langgraph_symbols()
 
         trace_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}.jsonl"
+        runtime_event_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}_runtime.jsonl"
         selected_files = self._select_files(instance)
 
         with TraceLogger(
@@ -2518,6 +2553,12 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
         events = load_trace_events(trace_path)
         validation = validate_trace_events(events)
         runtime_summary = self._runtime_event_summary(materializer)
+        self._write_runtime_events(
+            materializer=materializer,
+            runtime_event_path=runtime_event_path,
+            workflow_id=instance.instance_id,
+            agent_family="langgraph",
+        )
         return {
             "instance_id": instance.instance_id,
             "status": str(final_state.get("status", "UNRESOLVED")),
@@ -2528,6 +2569,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             "patch": str(final_state.get("final_patch_text", "")),
             "verification": str(final_state.get("final_verdict_text", "")),
             "trace_path": str(trace_path),
+            "runtime_event_path": str(runtime_event_path),
             "runtime_event_summary": runtime_summary,
             "trace_validation": {
                 "is_valid": validation.is_valid,

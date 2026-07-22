@@ -54,6 +54,9 @@ class MatchedRuntimeSubsetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
             trace_dir = tmpdir / "traces"
+            runtime_event_a = tmpdir / "a_runtime.jsonl"
+            runtime_event_b = tmpdir / "b_runtime.jsonl"
+            runtime_event_c = tmpdir / "c_runtime.jsonl"
             runner = AGENTIC.TracedAgentRunner(
                 backend=AGENTIC.StubModelBackend(),
                 trace_dir=trace_dir,
@@ -73,10 +76,124 @@ class MatchedRuntimeSubsetTests(unittest.TestCase):
             b = runner.run_instance(make_instance("b"))
             c = runner.run_instance(make_instance("c"))
 
+            for path, instance_id in (
+                (runtime_event_a, "a"),
+                (runtime_event_b, "b"),
+                (runtime_event_c, "c"),
+            ):
+                path.write_text(
+                    "\n".join(
+                        [
+                            json.dumps(
+                                {
+                                    "workflow_id": instance_id,
+                                    "segment_id": "system_v1",
+                                    "logical_id": "prompt/system",
+                                    "version": 1,
+                                    "role": "system",
+                                    "module": "system",
+                                    "operation": "REGISTER",
+                                    "timestamp": 0.0,
+                                    "from_semantic_state": None,
+                                    "to_semantic_state": "REGISTERED",
+                                    "from_residency_state": None,
+                                    "to_residency_state": "UNMATERIALIZED",
+                                    "lookup_status": None,
+                                    "execution_context_digest": None,
+                                    "reason": None,
+                                    "size_bytes": 10,
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "workflow_id": instance_id,
+                                    "segment_id": "system_v1",
+                                    "logical_id": "prompt/system",
+                                    "version": 1,
+                                    "role": "system",
+                                    "module": "system",
+                                    "operation": "MATERIALIZE_INTERNAL",
+                                    "timestamp": 1.0,
+                                    "from_semantic_state": "REGISTERED",
+                                    "to_semantic_state": "REGISTERED",
+                                    "from_residency_state": "UNMATERIALIZED",
+                                    "to_residency_state": "RESIDENT",
+                                    "lookup_status": "MISS",
+                                    "execution_context_digest": f"{instance_id}-ctx",
+                                    "reason": "first_materialization",
+                                    "size_bytes": 10,
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "workflow_id": instance_id,
+                                    "segment_id": "system_v1",
+                                    "logical_id": "prompt/system",
+                                    "version": 1,
+                                    "role": "system",
+                                    "module": "system",
+                                    "operation": "REUSE",
+                                    "timestamp": 2.0,
+                                    "from_semantic_state": "REGISTERED",
+                                    "to_semantic_state": "REGISTERED",
+                                    "from_residency_state": "RESIDENT",
+                                    "to_residency_state": "RESIDENT",
+                                    "lookup_status": "HIT_RESIDENT",
+                                    "execution_context_digest": f"{instance_id}-ctx",
+                                    "reason": "exact_context_match",
+                                    "size_bytes": 10,
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "workflow_id": instance_id,
+                                    "segment_id": "system_v1",
+                                    "logical_id": "prompt/system",
+                                    "version": 1,
+                                    "role": "system",
+                                    "module": "system",
+                                    "operation": "RECLAIM",
+                                    "timestamp": 3.0,
+                                    "from_semantic_state": "REGISTERED",
+                                    "to_semantic_state": "REGISTERED",
+                                    "from_residency_state": "RESIDENT",
+                                    "to_residency_state": "EVICTED",
+                                    "lookup_status": None,
+                                    "execution_context_digest": f"{instance_id}-ctx",
+                                    "reason": "release_reclamation",
+                                    "size_bytes": 10,
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "workflow_id": instance_id,
+                                    "segment_id": "system_v1",
+                                    "logical_id": "prompt/system",
+                                    "version": 1,
+                                    "role": "system",
+                                    "module": "system",
+                                    "operation": "RELEASE",
+                                    "timestamp": 4.0,
+                                    "from_semantic_state": "REGISTERED",
+                                    "to_semantic_state": "RELEASED",
+                                    "from_residency_state": "RESIDENT",
+                                    "to_residency_state": "EVICTED",
+                                    "lookup_status": None,
+                                    "execution_context_digest": None,
+                                    "reason": "semantic_release",
+                                    "size_bytes": 10,
+                                }
+                            ),
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
             left_path = tmpdir / "left.jsonl"
             left_rows = [
-                a,
-                b,
+                {**a, "runtime_event_path": str(runtime_event_a)},
+                {**b, "runtime_event_path": str(runtime_event_b)},
                 {
                     "instance_id": "left-error",
                     "status": "ERROR",
@@ -92,8 +209,8 @@ class MatchedRuntimeSubsetTests(unittest.TestCase):
 
             right_path = tmpdir / "right.jsonl"
             right_rows = [
-                b,
-                c,
+                {**b, "runtime_event_path": str(runtime_event_b)},
+                {**c, "runtime_event_path": str(runtime_event_c)},
             ]
             right_path.write_text(
                 "\n".join(json.dumps(row) for row in right_rows) + "\n",
@@ -112,6 +229,11 @@ class MatchedRuntimeSubsetTests(unittest.TestCase):
             self.assertEqual(report["right"]["trace_count"], 1)
             self.assertIn("a", report["left_unmatched_valid_instance_ids"])
             self.assertIn("c", report["right_unmatched_valid_instance_ids"])
+            self.assertIn("runtime_behavior", report["left"]["aggregate"])
+            self.assertGreater(
+                report["left"]["aggregate"]["runtime_behavior"]["event_count"],
+                0,
+            )
 
     def test_render_matched_markdown_mentions_labels_and_subset(self):
         report = {
@@ -137,6 +259,15 @@ class MatchedRuntimeSubsetTests(unittest.TestCase):
                         "ideal_segment_service_cost_units": 10.0,
                         "oracle_service_cost_savings_fraction": 0.5,
                     },
+                    "runtime_behavior": {
+                        "resident_hit_rate": 0.25,
+                        "resident_hits": 1,
+                        "misses": 3,
+                        "materializations": 3,
+                        "rematerializations": 1,
+                        "lifecycle_reclaims": 2,
+                        "policy_reclaims": 0,
+                    },
                 },
             },
             "right": {
@@ -156,11 +287,21 @@ class MatchedRuntimeSubsetTests(unittest.TestCase):
                         "ideal_segment_service_cost_units": 14.0,
                         "oracle_service_cost_savings_fraction": 0.44,
                     },
+                    "runtime_behavior": {
+                        "resident_hit_rate": 0.5,
+                        "resident_hits": 2,
+                        "misses": 2,
+                        "materializations": 2,
+                        "rematerializations": 0,
+                        "lifecycle_reclaims": 1,
+                        "policy_reclaims": 0,
+                    },
                 },
             },
         }
         markdown = MATCHED.render_matched_markdown(report)
         self.assertIn("# Matched Runtime Subset Comparison", markdown)
+        self.assertIn("## Practical Runtime", markdown)
         self.assertIn("mono", markdown)
         self.assertIn("seg", markdown)
         self.assertIn("demo-1", markdown)

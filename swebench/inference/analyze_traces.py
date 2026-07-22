@@ -38,22 +38,31 @@ def main():
         run_output_path=args.run_output_path,
     )
     trace_metadata_by_path = None
+    runtime_event_paths_by_trace_path = None
     run_summary = None
     if args.run_output_path:
         run_summary = summarize_run_output(args.run_output_path)
         trace_metadata_by_path = {}
+        runtime_event_paths_by_trace_path = {}
         for record in load_run_output_records(args.run_output_path):
             trace_path = record.get("trace_path")
             if not trace_path:
                 continue
-            trace_metadata_by_path[str(Path(str(trace_path)).resolve())] = {
+            resolved_trace_path = str(Path(str(trace_path)).resolve())
+            trace_metadata_by_path[resolved_trace_path] = {
                 "provider": record.get("provider", "unknown"),
                 "instance_id": record.get("instance_id", "unknown"),
                 "status": record.get("status", "unknown"),
             }
+            runtime_event_path = record.get("runtime_event_path")
+            if runtime_event_path:
+                runtime_event_paths_by_trace_path[resolved_trace_path] = str(
+                    Path(str(runtime_event_path)).resolve()
+                )
     report = analyze_trace_paths(
         trace_paths,
         trace_metadata_by_path=trace_metadata_by_path,
+        runtime_event_paths_by_trace_path=runtime_event_paths_by_trace_path,
         run_summary=run_summary,
     )
 

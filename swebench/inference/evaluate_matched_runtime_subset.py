@@ -42,6 +42,7 @@ def filtered_run_summary(records: List[Mapping[str, object]]) -> Dict[str, objec
     valid_trace_count = 0
     invalid_instance_ids = []
     missing_trace_path_count = 0
+    runtime_event_path_count = 0
     for record in records:
         provider = str(record.get("provider", "unknown"))
         provider_counts[provider] = provider_counts.get(provider, 0) + 1
@@ -52,6 +53,8 @@ def filtered_run_summary(records: List[Mapping[str, object]]) -> Dict[str, objec
             invalid_instance_ids.append(str(record.get("instance_id", "unknown")))
         if not record.get("trace_path"):
             missing_trace_path_count += 1
+        if record.get("runtime_event_path"):
+            runtime_event_path_count += 1
     real_backend_trace_count = sum(
         count for provider, count in provider_counts.items() if provider != "stub"
     )
@@ -61,6 +64,7 @@ def filtered_run_summary(records: List[Mapping[str, object]]) -> Dict[str, objec
         "valid_trace_count": valid_trace_count,
         "invalid_instance_ids": invalid_instance_ids,
         "missing_trace_path_count": missing_trace_path_count,
+        "runtime_event_path_count": runtime_event_path_count,
         "real_backend_trace_count": real_backend_trace_count,
         "stub_trace_count": provider_counts.get("stub", 0),
     }
@@ -81,6 +85,21 @@ def build_trace_metadata(records: Iterable[Mapping[str, object]]) -> Dict[str, D
     return metadata
 
 
+def build_runtime_event_metadata(
+    records: Iterable[Mapping[str, object]],
+) -> Dict[str, str]:
+    metadata: Dict[str, str] = {}
+    for record in records:
+        trace_path = record.get("trace_path")
+        runtime_event_path = record.get("runtime_event_path")
+        if not trace_path or not runtime_event_path:
+            continue
+        metadata[str(Path(str(trace_path)).resolve())] = str(
+            Path(str(runtime_event_path)).resolve()
+        )
+    return metadata
+
+
 def build_matched_report(
     *,
     left_run_output_path: str | Path,
@@ -98,11 +117,13 @@ def build_matched_report(
     left_report = analyze_trace_paths(
         [record["trace_path"] for record in left_subset],
         trace_metadata_by_path=build_trace_metadata(left_subset),
+        runtime_event_paths_by_trace_path=build_runtime_event_metadata(left_subset),
         run_summary=filtered_run_summary(left_subset),
     )
     right_report = analyze_trace_paths(
         [record["trace_path"] for record in right_subset],
         trace_metadata_by_path=build_trace_metadata(right_subset),
+        runtime_event_paths_by_trace_path=build_runtime_event_metadata(right_subset),
         run_summary=filtered_run_summary(right_subset),
     )
 
@@ -110,6 +131,8 @@ def build_matched_report(
     right_mismatch = right_report["aggregate"]["abstraction_mismatch"]
     left_bridge = left_report["aggregate"]["oracle_abstraction_bridge"]
     right_bridge = right_report["aggregate"]["oracle_abstraction_bridge"]
+    left_runtime = left_report["aggregate"].get("runtime_behavior")
+    right_runtime = right_report["aggregate"].get("runtime_behavior")
 
     comparison = {
         "matched_trace_count": len(matched_ids),
@@ -128,6 +151,24 @@ def build_matched_report(
             - right_bridge["oracle_service_cost_savings_fraction"],
         },
     }
+    if left_runtime is not None and right_runtime is not None:
+        comparison["left_minus_right"].update(
+            {
+                "resident_hit_rate": left_runtime["resident_hit_rate"]
+                - right_runtime["resident_hit_rate"],
+                "resident_hits": left_runtime["resident_hits"]
+                - right_runtime["resident_hits"],
+                "misses": left_runtime["misses"] - right_runtime["misses"],
+                "materializations": left_runtime["materializations"]
+                - right_runtime["materializations"],
+                "rematerializations": left_runtime["rematerializations"]
+                - right_runtime["rematerializations"],
+                "lifecycle_reclaims": left_runtime["lifecycle_reclaims"]
+                - right_runtime["lifecycle_reclaims"],
+                "policy_reclaims": left_runtime["policy_reclaims"]
+                - right_runtime["policy_reclaims"],
+            }
+        )
 
     return {
         "left_label": left_label,
@@ -152,6 +193,8 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
     right_mismatch = right_agg["abstraction_mismatch"]
     left_bridge = left_agg["oracle_abstraction_bridge"]
     right_bridge = right_agg["oracle_abstraction_bridge"]
+    left_runtime = left_agg.get("runtime_behavior")
+    right_runtime = right_agg.get("runtime_behavior")
 
     rows = [
         (
@@ -229,6 +272,34 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
             )
         else:
             lines.append(f"| {metric} | {left_value} | {right_value} | {delta} |")
+
+    if left_runtime is not None and right_runtime is not None:
+        runtime_rows = [
+            ("Resident hit rate", left_runtime["resident_hit_rate"], right_runtime["resident_hit_rate"]),
+            ("Resident hits", left_runtime["resident_hits"], right_runtime["resident_hits"]),
+            ("Misses", left_runtime["misses"], right_runtime["misses"]),
+            ("Materializations", left_runtime["materializations"], right_runtime["materializations"]),
+            ("Rematerializations", left_runtime["rematerializations"], right_runtime["rematerializations"]),
+            ("Lifecycle reclaims", left_runtime["lifecycle_reclaims"], right_runtime["lifecycle_reclaims"]),
+            ("Policy reclaims", left_runtime["policy_reclaims"], right_runtime["policy_reclaims"]),
+        ]
+        lines.extend(
+            [
+                "",
+                "## Practical Runtime",
+                "",
+                "| Metric | Left | Right | Left-Right |",
+                "| - | -: | -: | -: |",
+            ]
+        )
+        for metric, left_value, right_value in runtime_rows:
+            delta = left_value - right_value
+            if isinstance(left_value, float) or isinstance(right_value, float):
+                lines.append(
+                    f"| {metric} | {left_value:.4f} | {right_value:.4f} | {delta:.4f} |"
+                )
+            else:
+                lines.append(f"| {metric} | {left_value} | {right_value} | {delta} |")
 
     lines.extend(
         [

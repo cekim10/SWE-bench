@@ -92,12 +92,21 @@ def load_run_output_records(path: str | Path) -> List[Dict[str, object]]:
     ]
 
 
+def load_runtime_events(path: str | Path) -> List[Dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def summarize_run_output(path: str | Path) -> Dict[str, object]:
     records = load_run_output_records(path)
     provider_counts: Dict[str, int] = defaultdict(int)
     valid_trace_count = 0
     invalid_instance_ids = []
     missing_trace_path_count = 0
+    runtime_event_path_count = 0
     for record in records:
         provider = str(record.get("provider", "unknown"))
         provider_counts[provider] += 1
@@ -108,6 +117,8 @@ def summarize_run_output(path: str | Path) -> Dict[str, object]:
             invalid_instance_ids.append(str(record.get("instance_id", "unknown")))
         if not record.get("trace_path"):
             missing_trace_path_count += 1
+        if record.get("runtime_event_path"):
+            runtime_event_path_count += 1
 
     real_backend_trace_count = sum(
         count for provider, count in provider_counts.items() if provider != "stub"
@@ -118,6 +129,7 @@ def summarize_run_output(path: str | Path) -> Dict[str, object]:
         "valid_trace_count": valid_trace_count,
         "invalid_instance_ids": invalid_instance_ids,
         "missing_trace_path_count": missing_trace_path_count,
+        "runtime_event_path_count": runtime_event_path_count,
         "real_backend_trace_count": real_backend_trace_count,
         "stub_trace_count": provider_counts.get("stub", 0),
     }
@@ -270,10 +282,386 @@ def analyze_trace_events(events: Sequence[Mapping[str, object]]) -> Dict[str, ob
     }
 
 
+def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, object]:
+    if not events:
+        return _empty_runtime_behavior_summary()
+
+    op_counts: Dict[str, int] = defaultdict(int)
+    lookup_status_counts: Dict[str, int] = defaultdict(int)
+    role_counts: Dict[str, Dict[str, float | int | str]] = {}
+    workflow_counts: Dict[str, Dict[str, float | int | str]] = {}
+    execution_context_counts: Dict[str, Dict[str, float | int | str]] = {}
+    segment_stats: Dict[str, Dict[str, object]] = {}
+    last_timestamp = max(float(event.get("timestamp", 0.0)) for event in events)
+
+    lifecycle_reasons = {
+        "release_reclamation",
+        "supersede_reclamation",
+        "compat_invalidate",
+    }
+
+    def ensure_segment(event: Mapping[str, object]) -> Dict[str, object]:
+        segment_id = str(event.get("segment_id", "unknown"))
+        if segment_id not in segment_stats:
+            segment_stats[segment_id] = {
+                "segment_id": segment_id,
+                "logical_id": str(event.get("logical_id", segment_id)),
+                "workflow_id": str(event.get("workflow_id", "workflow")),
+                "role": str(event.get("role", "unknown")),
+                "module": str(event.get("module", "unknown")),
+                "version": int(event.get("version", 0)),
+                "size_bytes": int(event.get("size_bytes", 0)),
+                "registered_at": None,
+                "first_lookup_at": None,
+                "last_lookup_at": None,
+                "released_at": None,
+                "resident_hits": 0,
+                "evicted_hits": 0,
+                "misses": 0,
+                "invalid_lookups": 0,
+                "materializations": 0,
+                "rematerializations": 0,
+                "reuse_count": 0,
+            }
+        return segment_stats[segment_id]
+
+    def bump_runtime_bucket(
+        buckets: Dict[str, Dict[str, float | int | str]],
+        key: str,
+        *,
+        role: str | None = None,
+    ) -> Dict[str, float | int | str]:
+        if key not in buckets:
+            buckets[key] = {
+                "name": key,
+                "role": role or key,
+                "registrations": 0,
+                "resident_hits": 0,
+                "evicted_hits": 0,
+                "misses": 0,
+                "invalid_lookups": 0,
+                "materializations": 0,
+                "rematerializations": 0,
+                "reuse_count": 0,
+                "lifecycle_reclaims": 0,
+                "policy_reclaims": 0,
+                "bytes_reclaimed": 0,
+            }
+        return buckets[key]
+
+    for event in events:
+        operation = str(event.get("operation", "UNKNOWN"))
+        op_counts[operation] += 1
+        role = str(event.get("role", "unknown"))
+        workflow_id = str(event.get("workflow_id", "workflow"))
+        timestamp = float(event.get("timestamp", 0.0))
+        size_bytes = int(event.get("size_bytes", 0))
+        reason = str(event.get("reason", "")) if event.get("reason") is not None else ""
+        segment = ensure_segment(event)
+        role_bucket = bump_runtime_bucket(role_counts, role, role=role)
+        workflow_bucket = bump_runtime_bucket(workflow_counts, workflow_id)
+
+        status = event.get("lookup_status")
+        if status:
+            status_name = str(status)
+            lookup_status_counts[status_name] += 1
+            if segment["first_lookup_at"] is None:
+                segment["first_lookup_at"] = timestamp
+            segment["last_lookup_at"] = timestamp
+            if status_name == "HIT_RESIDENT":
+                role_bucket["resident_hits"] += 1
+                workflow_bucket["resident_hits"] += 1
+                segment["resident_hits"] = int(segment["resident_hits"]) + 1
+            elif status_name == "HIT_EVICTED":
+                role_bucket["evicted_hits"] += 1
+                workflow_bucket["evicted_hits"] += 1
+                segment["evicted_hits"] = int(segment["evicted_hits"]) + 1
+            elif status_name == "MISS":
+                role_bucket["misses"] += 1
+                workflow_bucket["misses"] += 1
+                segment["misses"] = int(segment["misses"]) + 1
+            elif status_name == "INVALID":
+                role_bucket["invalid_lookups"] += 1
+                workflow_bucket["invalid_lookups"] += 1
+                segment["invalid_lookups"] = int(segment["invalid_lookups"]) + 1
+
+        if operation == "REGISTER":
+            role_bucket["registrations"] += 1
+            workflow_bucket["registrations"] += 1
+            segment["registered_at"] = timestamp
+        elif operation == "REUSE":
+            role_bucket["reuse_count"] += 1
+            workflow_bucket["reuse_count"] += 1
+            segment["reuse_count"] = int(segment["reuse_count"]) + 1
+        elif operation == "MATERIALIZE_INTERNAL":
+            role_bucket["materializations"] += 1
+            workflow_bucket["materializations"] += 1
+            segment["materializations"] = int(segment["materializations"]) + 1
+            if reason == "rematerialization_after_eviction":
+                role_bucket["rematerializations"] += 1
+                workflow_bucket["rematerializations"] += 1
+                segment["rematerializations"] = int(segment["rematerializations"]) + 1
+        elif operation == "RECLAIM":
+            if reason == "policy_eviction":
+                role_bucket["policy_reclaims"] += 1
+                workflow_bucket["policy_reclaims"] += 1
+            elif reason in lifecycle_reasons:
+                role_bucket["lifecycle_reclaims"] += 1
+                workflow_bucket["lifecycle_reclaims"] += 1
+            role_bucket["bytes_reclaimed"] += size_bytes
+            workflow_bucket["bytes_reclaimed"] += size_bytes
+        elif operation == "RELEASE":
+            segment["released_at"] = timestamp
+
+        execution_context_digest = event.get("execution_context_digest")
+        if execution_context_digest:
+            digest = str(execution_context_digest)
+            if digest not in execution_context_counts:
+                execution_context_counts[digest] = {
+                    "execution_context_digest": digest,
+                    "workflow_id": workflow_id,
+                    "role": role,
+                    "segment_id": str(event.get("segment_id", "unknown")),
+                    "resident_hits": 0,
+                    "evicted_hits": 0,
+                    "misses": 0,
+                    "materializations": 0,
+                    "rematerializations": 0,
+                }
+            execution_bucket = execution_context_counts[digest]
+            if status == "HIT_RESIDENT":
+                execution_bucket["resident_hits"] = int(execution_bucket["resident_hits"]) + 1
+            elif status == "HIT_EVICTED":
+                execution_bucket["evicted_hits"] = int(execution_bucket["evicted_hits"]) + 1
+            elif status == "MISS":
+                execution_bucket["misses"] = int(execution_bucket["misses"]) + 1
+            if operation == "MATERIALIZE_INTERNAL":
+                execution_bucket["materializations"] = int(execution_bucket["materializations"]) + 1
+                if reason == "rematerialization_after_eviction":
+                    execution_bucket["rematerializations"] = int(
+                        execution_bucket["rematerializations"]
+                    ) + 1
+
+    role_segment_map: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    for segment in segment_stats.values():
+        role_segment_map[str(segment["role"])].append(segment)
+
+    role_rows = []
+    lifetime_rows = []
+    for role, bucket in sorted(role_counts.items()):
+        segments_for_role = role_segment_map.get(role, [])
+        registered_segments = len(segments_for_role)
+        registered_but_never_reused = sum(
+            int(segment["reuse_count"]) == 0 for segment in segments_for_role
+        )
+        reused_exactly_once = sum(
+            int(segment["reuse_count"]) == 1 for segment in segments_for_role
+        )
+        reused_more_than_five = sum(
+            int(segment["reuse_count"]) > 5 for segment in segments_for_role
+        )
+        misses = int(bucket["misses"])
+        resident_hits = int(bucket["resident_hits"])
+        evicted_hits = int(bucket["evicted_hits"])
+        invalid_lookups = int(bucket["invalid_lookups"])
+        denominator = resident_hits + misses + evicted_hits + invalid_lookups
+        role_rows.append(
+            {
+                "role": role,
+                "registrations": int(bucket["registrations"]),
+                "resident_hits": resident_hits,
+                "evicted_hits": evicted_hits,
+                "misses": misses,
+                "invalid_lookups": invalid_lookups,
+                "materializations": int(bucket["materializations"]),
+                "rematerializations": int(bucket["rematerializations"]),
+                "reuse_count": int(bucket["reuse_count"]),
+                "lifecycle_reclaims": int(bucket["lifecycle_reclaims"]),
+                "policy_reclaims": int(bucket["policy_reclaims"]),
+                "bytes_reclaimed": int(bucket["bytes_reclaimed"]),
+                "registered_segments": registered_segments,
+                "registered_but_never_reused": registered_but_never_reused,
+                "reused_exactly_once": reused_exactly_once,
+                "reused_more_than_five": reused_more_than_five,
+                "resident_hit_rate": (
+                    resident_hits / denominator if denominator else 0.0
+                ),
+            }
+        )
+
+        semantic_lifetimes = []
+        registration_to_first_lookup = []
+        lookup_spans = []
+        for segment in segments_for_role:
+            registered_at = segment["registered_at"]
+            first_lookup_at = segment["first_lookup_at"]
+            last_lookup_at = segment["last_lookup_at"]
+            released_at = segment["released_at"]
+            if registered_at is not None:
+                semantic_lifetimes.append(
+                    float(released_at if released_at is not None else last_timestamp)
+                    - float(registered_at)
+                )
+            if registered_at is not None and first_lookup_at is not None:
+                registration_to_first_lookup.append(
+                    float(first_lookup_at) - float(registered_at)
+                )
+            if first_lookup_at is not None and last_lookup_at is not None:
+                lookup_spans.append(float(last_lookup_at) - float(first_lookup_at))
+        lifetime_rows.append(
+            {
+                "role": role,
+                "count": registered_segments,
+                "avg_semantic_lifetime": (
+                    statistics.fmean(semantic_lifetimes) if semantic_lifetimes else 0.0
+                ),
+                "avg_registration_to_first_lookup": (
+                    statistics.fmean(registration_to_first_lookup)
+                    if registration_to_first_lookup
+                    else 0.0
+                ),
+                "avg_lookup_span": (
+                    statistics.fmean(lookup_spans) if lookup_spans else 0.0
+                ),
+                "registered_but_never_reused_ratio": (
+                    registered_but_never_reused / registered_segments
+                    if registered_segments
+                    else 0.0
+                ),
+            }
+        )
+
+    workflow_rows = []
+    for workflow_id, bucket in sorted(workflow_counts.items()):
+        misses = int(bucket["misses"])
+        resident_hits = int(bucket["resident_hits"])
+        evicted_hits = int(bucket["evicted_hits"])
+        invalid_lookups = int(bucket["invalid_lookups"])
+        denominator = resident_hits + misses + evicted_hits + invalid_lookups
+        workflow_rows.append(
+            {
+                "workflow_id": workflow_id,
+                "registrations": int(bucket["registrations"]),
+                "resident_hits": resident_hits,
+                "evicted_hits": evicted_hits,
+                "misses": misses,
+                "invalid_lookups": invalid_lookups,
+                "materializations": int(bucket["materializations"]),
+                "rematerializations": int(bucket["rematerializations"]),
+                "reuse_count": int(bucket["reuse_count"]),
+                "lifecycle_reclaims": int(bucket["lifecycle_reclaims"]),
+                "policy_reclaims": int(bucket["policy_reclaims"]),
+                "bytes_reclaimed": int(bucket["bytes_reclaimed"]),
+                "resident_hit_rate": (
+                    resident_hits / denominator if denominator else 0.0
+                ),
+            }
+        )
+
+    segment_rows = []
+    for segment in sorted(
+        segment_stats.values(),
+        key=lambda item: (
+            str(item["workflow_id"]),
+            str(item["role"]),
+            str(item["segment_id"]),
+        ),
+    ):
+        registered_at = segment["registered_at"]
+        released_at = segment["released_at"]
+        first_lookup_at = segment["first_lookup_at"]
+        last_lookup_at = segment["last_lookup_at"]
+        segment_rows.append(
+            {
+                **segment,
+                "semantic_lifetime": (
+                    float(released_at if released_at is not None else last_timestamp)
+                    - float(registered_at)
+                    if registered_at is not None
+                    else 0.0
+                ),
+                "registration_to_first_lookup": (
+                    float(first_lookup_at) - float(registered_at)
+                    if registered_at is not None and first_lookup_at is not None
+                    else None
+                ),
+                "lookup_span": (
+                    float(last_lookup_at) - float(first_lookup_at)
+                    if first_lookup_at is not None and last_lookup_at is not None
+                    else None
+                ),
+            }
+        )
+
+    resident_hits = lookup_status_counts.get("HIT_RESIDENT", 0)
+    evicted_hits = lookup_status_counts.get("HIT_EVICTED", 0)
+    misses = lookup_status_counts.get("MISS", 0)
+    invalid_lookups = lookup_status_counts.get("INVALID", 0)
+    resident_hit_denominator = resident_hits + evicted_hits + misses + invalid_lookups
+    registered_segments_total = len(segment_rows)
+    registered_but_never_reused = sum(
+        int(segment["reuse_count"]) == 0 for segment in segment_rows
+    )
+    reused_exactly_once = sum(
+        int(segment["reuse_count"]) == 1 for segment in segment_rows
+    )
+    reused_more_than_five = sum(
+        int(segment["reuse_count"]) > 5 for segment in segment_rows
+    )
+
+    return {
+        "event_count": len(events),
+        "op_counts": dict(sorted(op_counts.items())),
+        "lookup_status_counts": dict(sorted(lookup_status_counts.items())),
+        "resident_hit_rate": (
+            resident_hits / resident_hit_denominator if resident_hit_denominator else 0.0
+        ),
+        "registrations": op_counts.get("REGISTER", 0),
+        "resident_hits": resident_hits,
+        "evicted_hits": evicted_hits,
+        "misses": misses,
+        "invalid_lookups": invalid_lookups,
+        "materializations": op_counts.get("MATERIALIZE_INTERNAL", 0),
+        "rematerializations": sum(
+            int(segment["rematerializations"]) for segment in segment_rows
+        ),
+        "reuse_count": op_counts.get("REUSE", 0),
+        "lifecycle_reclaims": sum(
+            int(bucket["lifecycle_reclaims"]) for bucket in role_counts.values()
+        ),
+        "policy_reclaims": sum(
+            int(bucket["policy_reclaims"]) for bucket in role_counts.values()
+        ),
+        "bytes_reclaimed": sum(
+            int(bucket["bytes_reclaimed"]) for bucket in role_counts.values()
+        ),
+        "registered_segments": registered_segments_total,
+        "segment_reuse_buckets": {
+            "registered_segments": registered_segments_total,
+            "registered_but_never_reused": registered_but_never_reused,
+            "reused_exactly_once": reused_exactly_once,
+            "reused_more_than_five": reused_more_than_five,
+        },
+        "role_rows": role_rows,
+        "workflow_rows": workflow_rows,
+        "lifetime_rows": lifetime_rows,
+        "segment_rows": segment_rows,
+        "execution_context_rows": sorted(
+            execution_context_counts.values(),
+            key=lambda item: (
+                str(item["workflow_id"]),
+                str(item["segment_id"]),
+                str(item["execution_context_digest"]),
+            ),
+        ),
+    }
+
+
 def analyze_trace_paths(
     trace_paths: Sequence[str | Path],
     *,
     trace_metadata_by_path: Mapping[str, Mapping[str, object]] | None = None,
+    runtime_event_paths_by_trace_path: Mapping[str, str | Path] | None = None,
     run_summary: Mapping[str, object] | None = None,
 ) -> Dict[str, object]:
     per_trace = {}
@@ -282,6 +670,12 @@ def analyze_trace_paths(
     for path in trace_paths:
         resolved = str(Path(path).resolve())
         analysis = analyze_trace_events(load_trace_events(path))
+        if runtime_event_paths_by_trace_path is not None:
+            runtime_event_path = runtime_event_paths_by_trace_path.get(resolved)
+            if runtime_event_path:
+                analysis["runtime_behavior"] = analyze_runtime_events(
+                    load_runtime_events(runtime_event_path)
+                )
         per_trace[resolved] = analysis
         analyses.append(analysis)
         if trace_metadata_by_path is not None and resolved in trace_metadata_by_path:
@@ -327,6 +721,7 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Real-backend traces: {run_summary['real_backend_trace_count']}",
                 f"- Stub traces: {run_summary['stub_trace_count']}",
                 f"- Missing trace paths: {run_summary['missing_trace_path_count']}",
+                f"- Runtime event logs: {run_summary.get('runtime_event_path_count', 0)}",
                 "",
             ]
         )
@@ -468,6 +863,55 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
             f"- Oracle service-cost savings fraction: {bridge['oracle_service_cost_savings_fraction']:.2f}",
         ]
     )
+
+    runtime_behavior = aggregate.get("runtime_behavior")
+    if runtime_behavior is not None:
+        lines.extend(
+            [
+                "",
+                "## Practical Runtime",
+                "",
+                f"- Runtime events: {runtime_behavior['event_count']}",
+                f"- Resident hit rate: {runtime_behavior['resident_hit_rate']:.2f}",
+                f"- Resident hits: {runtime_behavior['resident_hits']}",
+                f"- Evicted hits: {runtime_behavior['evicted_hits']}",
+                f"- Misses: {runtime_behavior['misses']}",
+                f"- Invalid lookups: {runtime_behavior['invalid_lookups']}",
+                f"- Materializations: {runtime_behavior['materializations']}",
+                f"- Rematerializations: {runtime_behavior['rematerializations']}",
+                f"- Reuse count: {runtime_behavior['reuse_count']}",
+                f"- Lifecycle reclaims: {runtime_behavior['lifecycle_reclaims']}",
+                f"- Policy reclaims: {runtime_behavior['policy_reclaims']}",
+                f"- Bytes reclaimed: {runtime_behavior['bytes_reclaimed']}",
+                "",
+                "### Reuse By Role",
+                "",
+                "| Role | Registrations | Resident Hits | Misses | Materializations | Rematerializations | Lifecycle Reclaims | Policy Reclaims | Never Reused | Reused Once | Reused >5 | Resident Hit Rate |",
+                "| - | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: |",
+            ]
+        )
+        for row in runtime_behavior["role_rows"]:
+            lines.append(
+                f"| {row['role']} | {row['registrations']} | {row['resident_hits']} | {row['misses']} | "
+                f"{row['materializations']} | {row['rematerializations']} | {row['lifecycle_reclaims']} | "
+                f"{row['policy_reclaims']} | {row['registered_but_never_reused']} | {row['reused_exactly_once']} | "
+                f"{row['reused_more_than_five']} | {row['resident_hit_rate']:.2f} |"
+            )
+        lines.extend(
+            [
+                "",
+                "### Segment Lifetime Vs Reuse",
+                "",
+                "| Role | Count | Avg Semantic Lifetime | Avg Registration->First Lookup | Avg Lookup Span | Never Reused Ratio |",
+                "| - | -: | -: | -: | -: | -: |",
+            ]
+        )
+        for row in runtime_behavior["lifetime_rows"]:
+            lines.append(
+                f"| {row['role']} | {row['count']} | {row['avg_semantic_lifetime']:.2f} | "
+                f"{row['avg_registration_to_first_lookup']:.2f} | {row['avg_lookup_span']:.2f} | "
+                f"{row['registered_but_never_reused_ratio']:.2f} |"
+            )
 
     if "providers" in report:
         lines.extend(
@@ -850,6 +1294,38 @@ def _empty_oracle_bridge_summary() -> Dict[str, object]:
     }
 
 
+def _empty_runtime_behavior_summary() -> Dict[str, object]:
+    return {
+        "event_count": 0,
+        "op_counts": {},
+        "lookup_status_counts": {},
+        "resident_hit_rate": 0.0,
+        "registrations": 0,
+        "resident_hits": 0,
+        "evicted_hits": 0,
+        "misses": 0,
+        "invalid_lookups": 0,
+        "materializations": 0,
+        "rematerializations": 0,
+        "reuse_count": 0,
+        "lifecycle_reclaims": 0,
+        "policy_reclaims": 0,
+        "bytes_reclaimed": 0,
+        "registered_segments": 0,
+        "segment_reuse_buckets": {
+            "registered_segments": 0,
+            "registered_but_never_reused": 0,
+            "reused_exactly_once": 0,
+            "reused_more_than_five": 0,
+        },
+        "role_rows": [],
+        "workflow_rows": [],
+        "lifetime_rows": [],
+        "segment_rows": [],
+        "execution_context_rows": [],
+    }
+
+
 def _legacy_bridge_alias(oracle_bridge: Mapping[str, object]) -> Dict[str, object]:
     return {
         "transition_count": int(oracle_bridge["transition_count"]),
@@ -928,6 +1404,220 @@ def _coerce_oracle_bridge(analysis: Mapping[str, object]) -> Dict[str, object]:
     }
 
 
+def _coerce_runtime_behavior(analysis: Mapping[str, object]) -> Dict[str, object]:
+    return dict(analysis.get("runtime_behavior", _empty_runtime_behavior_summary()))
+
+
+def _aggregate_runtime_behaviors(
+    runtime_behaviors: Sequence[Mapping[str, object]],
+) -> Dict[str, object]:
+    if not runtime_behaviors:
+        return _empty_runtime_behavior_summary()
+
+    op_counts: Dict[str, int] = defaultdict(int)
+    lookup_status_counts: Dict[str, int] = defaultdict(int)
+    role_rows: Dict[str, Dict[str, object]] = {}
+    workflow_rows: Dict[str, Dict[str, object]] = {}
+    lifetime_rows: Dict[str, Dict[str, object]] = {}
+
+    def ensure_row(
+        rows: Dict[str, Dict[str, object]],
+        key: str,
+        *,
+        row_key: str,
+    ) -> Dict[str, object]:
+        if key not in rows:
+            rows[key] = {row_key: key}
+        return rows[key]
+
+    for behavior in runtime_behaviors:
+        for op, count in dict(behavior.get("op_counts", {})).items():
+            op_counts[str(op)] += int(count)
+        for status, count in dict(behavior.get("lookup_status_counts", {})).items():
+            lookup_status_counts[str(status)] += int(count)
+
+        for row in behavior.get("role_rows", []):
+            role = str(row["role"])
+            output = ensure_row(role_rows, role, row_key="role")
+            for field_name in (
+                "registrations",
+                "resident_hits",
+                "evicted_hits",
+                "misses",
+                "invalid_lookups",
+                "materializations",
+                "rematerializations",
+                "reuse_count",
+                "lifecycle_reclaims",
+                "policy_reclaims",
+                "bytes_reclaimed",
+                "registered_segments",
+                "registered_but_never_reused",
+                "reused_exactly_once",
+                "reused_more_than_five",
+            ):
+                output[field_name] = int(output.get(field_name, 0)) + int(row[field_name])
+
+        for row in behavior.get("workflow_rows", []):
+            workflow_id = str(row["workflow_id"])
+            output = ensure_row(workflow_rows, workflow_id, row_key="workflow_id")
+            for field_name in (
+                "registrations",
+                "resident_hits",
+                "evicted_hits",
+                "misses",
+                "invalid_lookups",
+                "materializations",
+                "rematerializations",
+                "reuse_count",
+                "lifecycle_reclaims",
+                "policy_reclaims",
+                "bytes_reclaimed",
+            ):
+                output[field_name] = int(output.get(field_name, 0)) + int(row[field_name])
+
+        for row in behavior.get("lifetime_rows", []):
+            role = str(row["role"])
+            output = ensure_row(lifetime_rows, role, row_key="role")
+            count = int(row["count"])
+            output["count"] = int(output.get("count", 0)) + count
+            for field_name in (
+                "avg_semantic_lifetime",
+                "avg_registration_to_first_lookup",
+                "avg_lookup_span",
+                "registered_but_never_reused_ratio",
+            ):
+                weighted_total = float(output.get(f"{field_name}_weighted_total", 0.0))
+                weighted_total += float(row[field_name]) * count
+                output[f"{field_name}_weighted_total"] = weighted_total
+
+    resident_hits = lookup_status_counts.get("HIT_RESIDENT", 0)
+    evicted_hits = lookup_status_counts.get("HIT_EVICTED", 0)
+    misses = lookup_status_counts.get("MISS", 0)
+    invalid_lookups = lookup_status_counts.get("INVALID", 0)
+    denominator = resident_hits + evicted_hits + misses + invalid_lookups
+
+    finalized_role_rows = []
+    for role, row in sorted(role_rows.items()):
+        row = dict(row)
+        local_denominator = (
+            int(row["resident_hits"])
+            + int(row["evicted_hits"])
+            + int(row["misses"])
+            + int(row["invalid_lookups"])
+        )
+        row["resident_hit_rate"] = (
+            int(row["resident_hits"]) / local_denominator if local_denominator else 0.0
+        )
+        finalized_role_rows.append(row)
+
+    finalized_workflow_rows = []
+    for workflow_id, row in sorted(workflow_rows.items()):
+        row = dict(row)
+        local_denominator = (
+            int(row["resident_hits"])
+            + int(row["evicted_hits"])
+            + int(row["misses"])
+            + int(row["invalid_lookups"])
+        )
+        row["resident_hit_rate"] = (
+            int(row["resident_hits"]) / local_denominator if local_denominator else 0.0
+        )
+        finalized_workflow_rows.append(row)
+
+    finalized_lifetime_rows = []
+    for role, row in sorted(lifetime_rows.items()):
+        count = int(row["count"])
+        finalized_lifetime_rows.append(
+            {
+                "role": role,
+                "count": count,
+                "avg_semantic_lifetime": (
+                    float(row.get("avg_semantic_lifetime_weighted_total", 0.0)) / count
+                    if count
+                    else 0.0
+                ),
+                "avg_registration_to_first_lookup": (
+                    float(
+                        row.get("avg_registration_to_first_lookup_weighted_total", 0.0)
+                    )
+                    / count
+                    if count
+                    else 0.0
+                ),
+                "avg_lookup_span": (
+                    float(row.get("avg_lookup_span_weighted_total", 0.0)) / count
+                    if count
+                    else 0.0
+                ),
+                "registered_but_never_reused_ratio": (
+                    float(
+                        row.get(
+                            "registered_but_never_reused_ratio_weighted_total",
+                            0.0,
+                        )
+                    )
+                    / count
+                    if count
+                    else 0.0
+                ),
+            }
+        )
+
+    registered_segments = sum(
+        int(row["registered_segments"]) for row in finalized_role_rows
+    )
+    registered_but_never_reused = sum(
+        int(row["registered_but_never_reused"]) for row in finalized_role_rows
+    )
+    reused_exactly_once = sum(
+        int(row["reused_exactly_once"]) for row in finalized_role_rows
+    )
+    reused_more_than_five = sum(
+        int(row["reused_more_than_five"]) for row in finalized_role_rows
+    )
+
+    return {
+        "event_count": sum(int(behavior["event_count"]) for behavior in runtime_behaviors),
+        "op_counts": dict(sorted(op_counts.items())),
+        "lookup_status_counts": dict(sorted(lookup_status_counts.items())),
+        "resident_hit_rate": resident_hits / denominator if denominator else 0.0,
+        "registrations": sum(int(behavior["registrations"]) for behavior in runtime_behaviors),
+        "resident_hits": resident_hits,
+        "evicted_hits": evicted_hits,
+        "misses": misses,
+        "invalid_lookups": invalid_lookups,
+        "materializations": sum(
+            int(behavior["materializations"]) for behavior in runtime_behaviors
+        ),
+        "rematerializations": sum(
+            int(behavior["rematerializations"]) for behavior in runtime_behaviors
+        ),
+        "reuse_count": sum(int(behavior["reuse_count"]) for behavior in runtime_behaviors),
+        "lifecycle_reclaims": sum(
+            int(behavior["lifecycle_reclaims"]) for behavior in runtime_behaviors
+        ),
+        "policy_reclaims": sum(
+            int(behavior["policy_reclaims"]) for behavior in runtime_behaviors
+        ),
+        "bytes_reclaimed": sum(
+            int(behavior["bytes_reclaimed"]) for behavior in runtime_behaviors
+        ),
+        "registered_segments": registered_segments,
+        "segment_reuse_buckets": {
+            "registered_segments": registered_segments,
+            "registered_but_never_reused": registered_but_never_reused,
+            "reused_exactly_once": reused_exactly_once,
+            "reused_more_than_five": reused_more_than_five,
+        },
+        "role_rows": finalized_role_rows,
+        "workflow_rows": finalized_workflow_rows,
+        "lifetime_rows": finalized_lifetime_rows,
+        "segment_rows": [],
+        "execution_context_rows": [],
+    }
+
+
 def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, object]:
     if not analyses:
         return {
@@ -948,6 +1638,7 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
                 "avg_lifetime_spread": 0.0,
                 "lifetime_spread_per_prompt": [],
             },
+            "runtime_behavior": _empty_runtime_behavior_summary(),
             "oracle_abstraction_bridge": _empty_oracle_bridge_summary(),
             "abstraction_bridge": _legacy_bridge_alias(_empty_oracle_bridge_summary()),
         }
@@ -1135,6 +1826,14 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
         else 0.0
     )
 
+    runtime_behavior = _aggregate_runtime_behaviors(
+        [
+            _coerce_runtime_behavior(analysis)
+            for analysis in analyses
+            if "runtime_behavior" in analysis
+        ]
+    )
+
     return {
         "state_count": total_state_count,
         "prompt_call_count": total_prompt_calls,
@@ -1142,6 +1841,7 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
         "lifecycle_characterization": {"module_rows": module_lifecycle_rows},
         "lifetime_correlation": lifetime_correlation,
         "abstraction_mismatch": mismatch,
+        "runtime_behavior": runtime_behavior,
         "oracle_abstraction_bridge": oracle_abstraction_bridge,
         "abstraction_bridge": _legacy_bridge_alias(oracle_abstraction_bridge),
     }
