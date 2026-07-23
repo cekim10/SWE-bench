@@ -6,6 +6,7 @@ import importlib.util
 import math
 import os
 import re
+from hashlib import sha256
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Protocol, Sequence, TypedDict
@@ -740,6 +741,11 @@ class TracedAgentRunner:
                 "prompt_runtime_mode must be one of {'monolithic', 'segment_aware'}"
             )
         self.prompt_runtime_mode = prompt_runtime_mode
+        self._reset_monolithic_prompt_runtime_state()
+
+    def _reset_monolithic_prompt_runtime_state(self) -> None:
+        self._monolithic_prompt_versions_by_consumer: Dict[str, int] = {}
+        self._monolithic_prompt_current_by_consumer: Dict[str, Dict[str, object]] = {}
 
     def _tier_from_materialization(self, materialization: str | None) -> ResidencyTier | None:
         if materialization == "HBM":
@@ -765,6 +771,8 @@ class TracedAgentRunner:
         is_ephemeral: bool,
         metadata: Mapping[str, object] | None = None,
     ) -> None:
+        if self.prompt_runtime_mode != "segment_aware":
+            return
         segment = ContextSegment(
             state_id=handle.state_id,
             identity=SegmentIdentity(logical_key=handle.logical_key, module=module),
@@ -789,9 +797,128 @@ class TracedAgentRunner:
         materializer: SegmentRuntime,
         state_id: str | None,
     ) -> None:
+        if self.prompt_runtime_mode != "segment_aware":
+            return
         if state_id is None:
             return
         materializer.release_segment(state_id)
+
+    def _prepare_monolithic_prompt(
+        self,
+        *,
+        materializer: SegmentRuntime,
+        trace: TraceLogger,
+        workflow_id: str,
+        consumer: str,
+        step_name: str,
+        prompt_id: str,
+        system_prompt: str,
+        user_prompt: str,
+        segments: Sequence[Mapping[str, object]],
+        metadata: Mapping[str, object] | None = None,
+    ) -> tuple[ContextSegmentGroup, RuntimeResidencySnapshot]:
+        prompt_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt_signature = sha256(
+            json.dumps(prompt_messages, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        current = self._monolithic_prompt_current_by_consumer.get(consumer)
+        if current is None or current["signature"] != prompt_signature:
+            version = self._monolithic_prompt_versions_by_consumer.get(consumer, 0) + 1
+            self._monolithic_prompt_versions_by_consumer[consumer] = version
+            state_id = f"mono_{sanitize_state_suffix(consumer)}_v{version}"
+            segment = ContextSegment(
+                state_id=state_id,
+                identity=SegmentIdentity(
+                    logical_key=f"runtime/monolithic/{consumer}",
+                    module="monolithic_context",
+                ),
+                version=version,
+                role="monolithic",
+                size_bytes=size_bytes(system_prompt) + size_bytes(user_prompt),
+                token_count=approx_token_count(system_prompt) + approx_token_count(user_prompt),
+                workflow_id=workflow_id,
+                text=f"{system_prompt}\n\n{user_prompt}",
+                recompute_cost=max(
+                    1.0,
+                    (
+                        approx_token_count(system_prompt) + approx_token_count(user_prompt)
+                    )
+                    / 16.0,
+                ),
+                reload_cost=max(
+                    0.5,
+                    (size_bytes(system_prompt) + size_bytes(user_prompt)) / 256.0,
+                ),
+                is_shared=False,
+                is_immutable=False,
+                is_ephemeral=False,
+                metadata={
+                    "role": "monolithic",
+                    "consumer": consumer,
+                    "prompt_id": prompt_id,
+                    "step_name": step_name,
+                    "signature": prompt_signature,
+                },
+                residency_hint=ResidencyTier.HBM,
+            )
+            previous_state_id = (
+                str(current["state_id"]) if current is not None else None
+            )
+            if previous_state_id is None:
+                materializer.register_segment(segment)
+            else:
+                materializer.supersede_segment(previous_state_id, segment)
+            self._monolithic_prompt_current_by_consumer[consumer] = {
+                "state_id": state_id,
+                "signature": prompt_signature,
+            }
+
+        state_id = str(self._monolithic_prompt_current_by_consumer[consumer]["state_id"])
+        group = materializer.build_group(
+            group_id=prompt_id,
+            workflow_id=workflow_id,
+            consumer=consumer,
+            ordered_segment_ids=[state_id],
+            prompt_id=prompt_id,
+        )
+        materializer.prepare_group_read(
+            group,
+            model_id=self.backend.runtime_model_id,
+            tokenizer_id=self.backend.runtime_tokenizer_id,
+            inference_config=self.backend.runtime_inference_config(
+                step_name=step_name,
+                prompt_mode="monolithic",
+            ),
+        )
+        snapshot = materializer.snapshot()
+        trace.log_prompt_segments(
+            consumer=consumer,
+            prompt_id=prompt_id,
+            segments=segments,
+            metadata={
+                **dict(metadata or {}),
+                "runtime_group_id": group.group_id,
+                "runtime_prompt_mode": "monolithic",
+                "runtime_model_id": self.backend.runtime_model_id,
+                "runtime_tokenizer_id": self.backend.runtime_tokenizer_id,
+                "runtime_hbm_bytes": snapshot.hbm_bytes,
+                "runtime_cpu_bytes": snapshot.cpu_bytes,
+                "runtime_monolithic_state_id": state_id,
+            },
+        )
+        return group, snapshot
+
+    def _release_monolithic_prompt_runtime(
+        self,
+        *,
+        materializer: SegmentRuntime,
+    ) -> None:
+        for current in list(self._monolithic_prompt_current_by_consumer.values()):
+            materializer.release_segment(str(current["state_id"]))
+        self._reset_monolithic_prompt_runtime_state()
 
     def _prepare_segmented_prompt(
         self,
@@ -802,6 +929,8 @@ class TracedAgentRunner:
         consumer: str,
         step_name: str,
         prompt_id: str,
+        system_prompt: str = "",
+        user_prompt: str = "",
         segments: Sequence[Mapping[str, object]],
         metadata: Mapping[str, object] | None = None,
     ) -> tuple[ContextSegmentGroup, SegmentedGenerationRequest, RuntimeResidencySnapshot]:
@@ -847,6 +976,8 @@ class TracedAgentRunner:
         consumer: str,
         step_name: str,
         prompt_id: str,
+        system_prompt: str,
+        user_prompt: str,
         segments: Sequence[Mapping[str, object]],
         metadata: Mapping[str, object] | None = None,
     ) -> tuple[
@@ -863,24 +994,26 @@ class TracedAgentRunner:
                 consumer=consumer,
                 step_name=step_name,
                 prompt_id=prompt_id,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
                 segments=segments,
                 metadata=metadata,
             )
             return "segment_aware", group, request, snapshot
 
-        trace.log_prompt_segments(
+        group, snapshot = self._prepare_monolithic_prompt(
+            materializer=materializer,
+            trace=trace,
+            workflow_id=workflow_id,
             consumer=consumer,
+            step_name=step_name,
             prompt_id=prompt_id,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             segments=segments,
-            metadata={
-                **dict(metadata or {}),
-                "runtime_group_id": prompt_id,
-                "runtime_prompt_mode": "monolithic",
-                "runtime_model_id": self.backend.runtime_model_id,
-                "runtime_tokenizer_id": self.backend.runtime_tokenizer_id,
-            },
+            metadata=metadata,
         )
-        return "monolithic", None, None, None
+        return "monolithic", group, None, snapshot
 
     def _runtime_event_summary(self, materializer: SegmentRuntime) -> Dict[str, object]:
         events = materializer.events()
@@ -923,6 +1056,7 @@ class TracedAgentRunner:
                     "execution_context_digest": event.execution_context_digest,
                     "reason": event.reason,
                     "size_bytes": event.size_bytes,
+                    "token_count": segment.token_count,
                     "agent_family": agent_family,
                     "provider": getattr(self.backend, "name", self.backend.__class__.__name__),
                 }
@@ -1890,6 +2024,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
         trace_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}.jsonl"
         runtime_event_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}_runtime.jsonl"
         selected_files = self._select_files(instance)
+        self._reset_monolithic_prompt_runtime_state()
 
         with TraceLogger(
             trace_path,
@@ -2055,6 +2190,13 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     consumer="router",
                     step_name="router",
                     prompt_id=f"router-{iteration}",
+                    system_prompt=self._router_system_prompt(),
+                    user_prompt=self._router_user_prompt(
+                        instance,
+                        selected_files,
+                        iteration,
+                        diagnostic_state_id,
+                    ),
                     segments=router_segments,
                     metadata={"hook": "router.messages_for_llm", "iteration": iteration},
                 )
@@ -2147,6 +2289,13 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     consumer="planner",
                     step_name="planner",
                     prompt_id=f"planner-{iteration}",
+                    system_prompt=self._planner_system_prompt(),
+                    user_prompt=self._planner_user_prompt(
+                        instance,
+                        selected_files,
+                        iteration,
+                        diagnostic_state_id,
+                    ),
                     segments=planner_segments,
                     metadata={"hook": "planner.messages_for_llm", "iteration": iteration},
                 )
@@ -2233,6 +2382,13 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     consumer="coder",
                     step_name="coder",
                     prompt_id=f"coder-{iteration}",
+                    system_prompt=self._coder_system_prompt(),
+                    user_prompt=self._coder_user_prompt(
+                        instance,
+                        selected_files,
+                        plan_text,
+                        iteration,
+                    ),
                     segments=coder_segments,
                     metadata={"hook": "coder.messages_for_llm", "iteration": iteration},
                 )
@@ -2312,6 +2468,13 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     consumer="reviewer",
                     step_name="reviewer",
                     prompt_id=f"reviewer-{iteration}",
+                    system_prompt=self._reviewer_system_prompt(),
+                    user_prompt=self._reviewer_user_prompt(
+                        instance,
+                        plan_text,
+                        patch_text,
+                        iteration,
+                    ),
                     segments=reviewer_segments,
                     metadata={"hook": "reviewer.messages_for_llm", "iteration": iteration},
                 )
@@ -2385,6 +2548,13 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     consumer="tester",
                     step_name="tester",
                     prompt_id=f"tester-{iteration}",
+                    system_prompt=self._tester_system_prompt(),
+                    user_prompt=self._tester_user_prompt(
+                        instance,
+                        plan_text,
+                        patch_text,
+                        iteration,
+                    ),
                     segments=tester_segments,
                     metadata={"hook": "tester.messages_for_llm", "iteration": iteration},
                 )
@@ -2549,6 +2719,8 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             for state_id in sorted(live_state_ids):
                 trace.release_state(state_id, consumer="workflow", metadata={"reason": "workflow_end"})
                 self._release_runtime_segment(materializer=materializer, state_id=state_id)
+            if self.prompt_runtime_mode == "monolithic":
+                self._release_monolithic_prompt_runtime(materializer=materializer)
 
         events = load_trace_events(trace_path)
         validation = validate_trace_events(events)

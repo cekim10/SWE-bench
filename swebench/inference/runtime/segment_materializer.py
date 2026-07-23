@@ -51,6 +51,7 @@ class ContextSegmentState(str, Enum):
 
 
 class SegmentRole(str, Enum):
+    MONOLITHIC = "monolithic"
     SYSTEM = "system"
     PLAN = "plan"
     EVIDENCE = "evidence"
@@ -280,6 +281,7 @@ class RuntimeEvent:
     execution_context_digest: str | None
     reason: str | None
     size_bytes: int
+    token_count: int
 
 
 @dataclass(frozen=True)
@@ -503,6 +505,7 @@ class SegmentRuntime:
                 execution_context_digest=execution_context.digest if execution_context else None,
                 reason=reason,
                 size_bytes=segment.size_bytes,
+                token_count=segment.token_count,
             )
         )
 

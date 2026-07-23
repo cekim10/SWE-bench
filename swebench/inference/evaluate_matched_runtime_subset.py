@@ -156,6 +156,8 @@ def build_matched_report(
             {
                 "resident_hit_rate": left_runtime["resident_hit_rate"]
                 - right_runtime["resident_hit_rate"],
+                "token_weighted_reuse_rate": left_runtime["token_weighted_reuse_rate"]
+                - right_runtime["token_weighted_reuse_rate"],
                 "resident_hits": left_runtime["resident_hits"]
                 - right_runtime["resident_hits"],
                 "misses": left_runtime["misses"] - right_runtime["misses"],
@@ -163,6 +165,10 @@ def build_matched_report(
                 - right_runtime["materializations"],
                 "rematerializations": left_runtime["rematerializations"]
                 - right_runtime["rematerializations"],
+                "reused_tokens": left_runtime["reused_tokens"]
+                - right_runtime["reused_tokens"],
+                "materialized_tokens": left_runtime["materialized_tokens"]
+                - right_runtime["materialized_tokens"],
                 "lifecycle_reclaims": left_runtime["lifecycle_reclaims"]
                 - right_runtime["lifecycle_reclaims"],
                 "policy_reclaims": left_runtime["policy_reclaims"]
@@ -276,10 +282,13 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
     if left_runtime is not None and right_runtime is not None:
         runtime_rows = [
             ("Resident hit rate", left_runtime["resident_hit_rate"], right_runtime["resident_hit_rate"]),
+            ("Token-weighted reuse rate", left_runtime["token_weighted_reuse_rate"], right_runtime["token_weighted_reuse_rate"]),
             ("Resident hits", left_runtime["resident_hits"], right_runtime["resident_hits"]),
             ("Misses", left_runtime["misses"], right_runtime["misses"]),
             ("Materializations", left_runtime["materializations"], right_runtime["materializations"]),
             ("Rematerializations", left_runtime["rematerializations"], right_runtime["rematerializations"]),
+            ("Reused tokens", left_runtime["reused_tokens"], right_runtime["reused_tokens"]),
+            ("Materialized tokens", left_runtime["materialized_tokens"], right_runtime["materialized_tokens"]),
             ("Lifecycle reclaims", left_runtime["lifecycle_reclaims"], right_runtime["lifecycle_reclaims"]),
             ("Policy reclaims", left_runtime["policy_reclaims"], right_runtime["policy_reclaims"]),
         ]

@@ -311,6 +311,7 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
                 "module": str(event.get("module", "unknown")),
                 "version": int(event.get("version", 0)),
                 "size_bytes": int(event.get("size_bytes", 0)),
+                "token_count": int(event.get("token_count", 0)),
                 "registered_at": None,
                 "first_lookup_at": None,
                 "last_lookup_at": None,
@@ -322,6 +323,9 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
                 "materializations": 0,
                 "rematerializations": 0,
                 "reuse_count": 0,
+                "reused_tokens": 0,
+                "materialized_tokens": 0,
+                "rematerialized_tokens": 0,
             }
         return segment_stats[segment_id]
 
@@ -346,6 +350,9 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
                 "lifecycle_reclaims": 0,
                 "policy_reclaims": 0,
                 "bytes_reclaimed": 0,
+                "reused_tokens": 0,
+                "materialized_tokens": 0,
+                "rematerialized_tokens": 0,
             }
         return buckets[key]
 
@@ -356,6 +363,7 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
         workflow_id = str(event.get("workflow_id", "workflow"))
         timestamp = float(event.get("timestamp", 0.0))
         size_bytes = int(event.get("size_bytes", 0))
+        token_count = int(event.get("token_count", 0))
         reason = str(event.get("reason", "")) if event.get("reason") is not None else ""
         segment = ensure_segment(event)
         role_bucket = bump_runtime_bucket(role_counts, role, role=role)
@@ -392,15 +400,24 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
         elif operation == "REUSE":
             role_bucket["reuse_count"] += 1
             workflow_bucket["reuse_count"] += 1
+            role_bucket["reused_tokens"] += token_count
+            workflow_bucket["reused_tokens"] += token_count
             segment["reuse_count"] = int(segment["reuse_count"]) + 1
+            segment["reused_tokens"] = int(segment["reused_tokens"]) + token_count
         elif operation == "MATERIALIZE_INTERNAL":
             role_bucket["materializations"] += 1
             workflow_bucket["materializations"] += 1
+            role_bucket["materialized_tokens"] += token_count
+            workflow_bucket["materialized_tokens"] += token_count
             segment["materializations"] = int(segment["materializations"]) + 1
+            segment["materialized_tokens"] = int(segment["materialized_tokens"]) + token_count
             if reason == "rematerialization_after_eviction":
                 role_bucket["rematerializations"] += 1
                 workflow_bucket["rematerializations"] += 1
+                role_bucket["rematerialized_tokens"] += token_count
+                workflow_bucket["rematerialized_tokens"] += token_count
                 segment["rematerializations"] = int(segment["rematerializations"]) + 1
+                segment["rematerialized_tokens"] = int(segment["rematerialized_tokens"]) + token_count
         elif operation == "RECLAIM":
             if reason == "policy_eviction":
                 role_bucket["policy_reclaims"] += 1
@@ -479,12 +496,21 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
                 "lifecycle_reclaims": int(bucket["lifecycle_reclaims"]),
                 "policy_reclaims": int(bucket["policy_reclaims"]),
                 "bytes_reclaimed": int(bucket["bytes_reclaimed"]),
+                "reused_tokens": int(bucket["reused_tokens"]),
+                "materialized_tokens": int(bucket["materialized_tokens"]),
+                "rematerialized_tokens": int(bucket["rematerialized_tokens"]),
                 "registered_segments": registered_segments,
                 "registered_but_never_reused": registered_but_never_reused,
                 "reused_exactly_once": reused_exactly_once,
                 "reused_more_than_five": reused_more_than_five,
                 "resident_hit_rate": (
                     resident_hits / denominator if denominator else 0.0
+                ),
+                "token_weighted_reuse_rate": (
+                    int(bucket["reused_tokens"])
+                    / (int(bucket["reused_tokens"]) + int(bucket["materialized_tokens"]))
+                    if (int(bucket["reused_tokens"]) + int(bucket["materialized_tokens"]))
+                    else 0.0
                 ),
             }
         )
@@ -552,8 +578,17 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
                 "lifecycle_reclaims": int(bucket["lifecycle_reclaims"]),
                 "policy_reclaims": int(bucket["policy_reclaims"]),
                 "bytes_reclaimed": int(bucket["bytes_reclaimed"]),
+                "reused_tokens": int(bucket["reused_tokens"]),
+                "materialized_tokens": int(bucket["materialized_tokens"]),
+                "rematerialized_tokens": int(bucket["rematerialized_tokens"]),
                 "resident_hit_rate": (
                     resident_hits / denominator if denominator else 0.0
+                ),
+                "token_weighted_reuse_rate": (
+                    int(bucket["reused_tokens"])
+                    / (int(bucket["reused_tokens"]) + int(bucket["materialized_tokens"]))
+                    if (int(bucket["reused_tokens"]) + int(bucket["materialized_tokens"]))
+                    else 0.0
                 ),
             }
         )
@@ -590,6 +625,8 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
                     if first_lookup_at is not None and last_lookup_at is not None
                     else None
                 ),
+                "reused_tokens": int(segment["reused_tokens"]),
+                "materialized_tokens": int(segment["materialized_tokens"]),
             }
         )
 
@@ -608,6 +645,9 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
     reused_more_than_five = sum(
         int(segment["reuse_count"]) > 5 for segment in segment_rows
     )
+    reused_tokens = sum(int(segment["reused_tokens"]) for segment in segment_rows)
+    materialized_tokens = sum(int(segment["materialized_tokens"]) for segment in segment_rows)
+    rematerialized_tokens = sum(int(segment["rematerialized_tokens"]) for segment in segment_rows)
 
     return {
         "event_count": len(events),
@@ -626,6 +666,14 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
             int(segment["rematerializations"]) for segment in segment_rows
         ),
         "reuse_count": op_counts.get("REUSE", 0),
+        "reused_tokens": reused_tokens,
+        "materialized_tokens": materialized_tokens,
+        "rematerialized_tokens": rematerialized_tokens,
+        "token_weighted_reuse_rate": (
+            reused_tokens / (reused_tokens + materialized_tokens)
+            if (reused_tokens + materialized_tokens)
+            else 0.0
+        ),
         "lifecycle_reclaims": sum(
             int(bucket["lifecycle_reclaims"]) for bucket in role_counts.values()
         ),
@@ -880,20 +928,24 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Materializations: {runtime_behavior['materializations']}",
                 f"- Rematerializations: {runtime_behavior['rematerializations']}",
                 f"- Reuse count: {runtime_behavior['reuse_count']}",
+                f"- Reused tokens: {runtime_behavior['reused_tokens']}",
+                f"- Materialized tokens: {runtime_behavior['materialized_tokens']}",
+                f"- Token-weighted reuse rate: {runtime_behavior['token_weighted_reuse_rate']:.2f}",
                 f"- Lifecycle reclaims: {runtime_behavior['lifecycle_reclaims']}",
                 f"- Policy reclaims: {runtime_behavior['policy_reclaims']}",
                 f"- Bytes reclaimed: {runtime_behavior['bytes_reclaimed']}",
                 "",
                 "### Reuse By Role",
                 "",
-                "| Role | Registrations | Resident Hits | Misses | Materializations | Rematerializations | Lifecycle Reclaims | Policy Reclaims | Never Reused | Reused Once | Reused >5 | Resident Hit Rate |",
-                "| - | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: |",
+                "| Role | Registrations | Resident Hits | Misses | Materializations | Reused Tokens | Materialized Tokens | Token-Weighted Reuse | Rematerializations | Lifecycle Reclaims | Policy Reclaims | Never Reused | Reused Once | Reused >5 | Resident Hit Rate |",
+                "| - | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: |",
             ]
         )
         for row in runtime_behavior["role_rows"]:
             lines.append(
                 f"| {row['role']} | {row['registrations']} | {row['resident_hits']} | {row['misses']} | "
-                f"{row['materializations']} | {row['rematerializations']} | {row['lifecycle_reclaims']} | "
+                f"{row['materializations']} | {row['reused_tokens']} | {row['materialized_tokens']} | "
+                f"{row['token_weighted_reuse_rate']:.2f} | {row['rematerializations']} | {row['lifecycle_reclaims']} | "
                 f"{row['policy_reclaims']} | {row['registered_but_never_reused']} | {row['reused_exactly_once']} | "
                 f"{row['reused_more_than_five']} | {row['resident_hit_rate']:.2f} |"
             )
@@ -1308,6 +1360,10 @@ def _empty_runtime_behavior_summary() -> Dict[str, object]:
         "materializations": 0,
         "rematerializations": 0,
         "reuse_count": 0,
+        "reused_tokens": 0,
+        "materialized_tokens": 0,
+        "rematerialized_tokens": 0,
+        "token_weighted_reuse_rate": 0.0,
         "lifecycle_reclaims": 0,
         "policy_reclaims": 0,
         "bytes_reclaimed": 0,
@@ -1451,6 +1507,9 @@ def _aggregate_runtime_behaviors(
                 "lifecycle_reclaims",
                 "policy_reclaims",
                 "bytes_reclaimed",
+                "reused_tokens",
+                "materialized_tokens",
+                "rematerialized_tokens",
                 "registered_segments",
                 "registered_but_never_reused",
                 "reused_exactly_once",
@@ -1473,6 +1532,9 @@ def _aggregate_runtime_behaviors(
                 "lifecycle_reclaims",
                 "policy_reclaims",
                 "bytes_reclaimed",
+                "reused_tokens",
+                "materialized_tokens",
+                "rematerialized_tokens",
             ):
                 output[field_name] = int(output.get(field_name, 0)) + int(row[field_name])
 
@@ -1509,6 +1571,12 @@ def _aggregate_runtime_behaviors(
         row["resident_hit_rate"] = (
             int(row["resident_hits"]) / local_denominator if local_denominator else 0.0
         )
+        row["token_weighted_reuse_rate"] = (
+            int(row["reused_tokens"])
+            / (int(row["reused_tokens"]) + int(row["materialized_tokens"]))
+            if (int(row["reused_tokens"]) + int(row["materialized_tokens"]))
+            else 0.0
+        )
         finalized_role_rows.append(row)
 
     finalized_workflow_rows = []
@@ -1522,6 +1590,12 @@ def _aggregate_runtime_behaviors(
         )
         row["resident_hit_rate"] = (
             int(row["resident_hits"]) / local_denominator if local_denominator else 0.0
+        )
+        row["token_weighted_reuse_rate"] = (
+            int(row["reused_tokens"])
+            / (int(row["reused_tokens"]) + int(row["materialized_tokens"]))
+            if (int(row["reused_tokens"]) + int(row["materialized_tokens"]))
+            else 0.0
         )
         finalized_workflow_rows.append(row)
 
@@ -1576,6 +1650,9 @@ def _aggregate_runtime_behaviors(
     reused_more_than_five = sum(
         int(row["reused_more_than_five"]) for row in finalized_role_rows
     )
+    reused_tokens = sum(int(row["reused_tokens"]) for row in finalized_role_rows)
+    materialized_tokens = sum(int(row["materialized_tokens"]) for row in finalized_role_rows)
+    rematerialized_tokens = sum(int(row["rematerialized_tokens"]) for row in finalized_role_rows)
 
     return {
         "event_count": sum(int(behavior["event_count"]) for behavior in runtime_behaviors),
@@ -1594,6 +1671,14 @@ def _aggregate_runtime_behaviors(
             int(behavior["rematerializations"]) for behavior in runtime_behaviors
         ),
         "reuse_count": sum(int(behavior["reuse_count"]) for behavior in runtime_behaviors),
+        "reused_tokens": reused_tokens,
+        "materialized_tokens": materialized_tokens,
+        "rematerialized_tokens": rematerialized_tokens,
+        "token_weighted_reuse_rate": (
+            reused_tokens / (reused_tokens + materialized_tokens)
+            if (reused_tokens + materialized_tokens)
+            else 0.0
+        ),
         "lifecycle_reclaims": sum(
             int(behavior["lifecycle_reclaims"]) for behavior in runtime_behaviors
         ),
