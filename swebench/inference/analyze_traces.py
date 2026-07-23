@@ -39,11 +39,13 @@ def main():
     )
     trace_metadata_by_path = None
     runtime_event_paths_by_trace_path = None
+    backend_call_paths_by_trace_path = None
     run_summary = None
     if args.run_output_path:
         run_summary = summarize_run_output(args.run_output_path)
         trace_metadata_by_path = {}
         runtime_event_paths_by_trace_path = {}
+        backend_call_paths_by_trace_path = {}
         for record in load_run_output_records(args.run_output_path):
             trace_path = record.get("trace_path")
             if not trace_path:
@@ -59,10 +61,16 @@ def main():
                 runtime_event_paths_by_trace_path[resolved_trace_path] = str(
                     Path(str(runtime_event_path)).resolve()
                 )
+            backend_call_path = record.get("backend_call_path")
+            if backend_call_path:
+                backend_call_paths_by_trace_path[resolved_trace_path] = str(
+                    Path(str(backend_call_path)).resolve()
+                )
     report = analyze_trace_paths(
         trace_paths,
         trace_metadata_by_path=trace_metadata_by_path,
         runtime_event_paths_by_trace_path=runtime_event_paths_by_trace_path,
+        backend_call_paths_by_trace_path=backend_call_paths_by_trace_path,
         run_summary=run_summary,
     )
 

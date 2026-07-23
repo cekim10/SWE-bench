@@ -209,9 +209,15 @@ class ModelBackend(Protocol):
     ) -> Mapping[str, object]:
         ...
 
+    def drain_call_records(self) -> List[Dict[str, object]]:
+        ...
+
 
 class StubModelBackend:
     name = "stub"
+
+    def __init__(self) -> None:
+        self._call_records: List[Dict[str, object]] = []
 
     def complete(
         self,
@@ -291,6 +297,11 @@ class StubModelBackend:
             "temperature": 0.0,
         }
 
+    def drain_call_records(self) -> List[Dict[str, object]]:
+        records = list(self._call_records)
+        self._call_records.clear()
+        return records
+
 
 class OpenAICompatibleChatBackend:
     name = "openai-compatible"
@@ -315,6 +326,7 @@ class OpenAICompatibleChatBackend:
         self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
+        self._call_records: List[Dict[str, object]] = []
 
     def _client(self):
         try:
@@ -397,6 +409,11 @@ class OpenAICompatibleChatBackend:
             "temperature": self.temperature,
         }
 
+    def drain_call_records(self) -> List[Dict[str, object]]:
+        records = list(self._call_records)
+        self._call_records.clear()
+        return records
+
 
 class VLLMServerChatBackend:
     name = "vllm"
@@ -411,6 +428,7 @@ class VLLMServerChatBackend:
     ) -> None:
         self.model = model
         self.temperature = temperature
+        self._call_records: List[Dict[str, object]] = []
         self.adapter = OpenAICompatibleVLLMAdapter(
             base_url=base_url or os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1"),
             api_key=os.environ.get("VLLM_API_KEY", "EMPTY"),
@@ -453,7 +471,30 @@ class VLLMServerChatBackend:
                 ),
             },
         )
-        return self.adapter.complete(request)
+        result = self.adapter.complete_with_details(request)
+        self._call_records.append(
+            {
+                "step_name": step_name,
+                "prompt_mode": prompt_mode,
+                "duration_ms": result.duration_ms,
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "total_tokens": result.total_tokens,
+                "message_digest": result.message_digest,
+                "segment_group_id": prompt_group.group_id if prompt_group is not None else None,
+                "segment_count": (
+                    len(segment_request.ordered_segments)
+                    if segment_request is not None
+                    else 0
+                ),
+                "runtime_hbm_bytes": (
+                    materializer_snapshot.hbm_bytes
+                    if materializer_snapshot is not None
+                    else None
+                ),
+            }
+        )
+        return result.text
 
     @property
     def runtime_model_id(self) -> str:
@@ -477,6 +518,11 @@ class VLLMServerChatBackend:
             "transport": "openai-compatible-vllm",
             "apc_enabled": True,
         }
+
+    def drain_call_records(self) -> List[Dict[str, object]]:
+        records = list(self._call_records)
+        self._call_records.clear()
+        return records
 
 
 class OpenAIChatBackend(OpenAICompatibleChatBackend):
@@ -552,6 +598,7 @@ class AnthropicMessagesBackend:
     def __init__(self, model: str, temperature: float = 0.0) -> None:
         self.model = model
         self.temperature = temperature
+        self._call_records: List[Dict[str, object]] = []
 
     def complete(
         self,
@@ -603,6 +650,11 @@ class AnthropicMessagesBackend:
             "temperature": self.temperature,
             "max_tokens": 1024,
         }
+
+    def drain_call_records(self) -> List[Dict[str, object]]:
+        records = list(self._call_records)
+        self._call_records.clear()
+        return records
 
 
 def make_backend(
@@ -1061,6 +1113,93 @@ class TracedAgentRunner:
                     "provider": getattr(self.backend, "name", self.backend.__class__.__name__),
                 }
                 handle.write(json.dumps(record) + "\n")
+
+    def _backend_call_summary(
+        self,
+        call_records: Sequence[Mapping[str, object]],
+    ) -> Dict[str, object]:
+        if not call_records:
+            return {
+                "request_count": 0,
+                "total_duration_ms": 0.0,
+                "avg_duration_ms": 0.0,
+                "total_prompt_tokens": 0,
+                "total_completion_tokens": 0,
+                "total_tokens": 0,
+                "avg_prompt_tokens": 0.0,
+                "duration_ms_per_1k_prompt_tokens": 0.0,
+                "step_rows": [],
+            }
+
+        total_duration_ms = sum(float(record.get("duration_ms", 0.0)) for record in call_records)
+        total_prompt_tokens = sum(int(record.get("prompt_tokens") or 0) for record in call_records)
+        total_completion_tokens = sum(
+            int(record.get("completion_tokens") or 0) for record in call_records
+        )
+        total_tokens = sum(int(record.get("total_tokens") or 0) for record in call_records)
+        grouped: Dict[tuple[str, str], List[Mapping[str, object]]] = {}
+        for record in call_records:
+            key = (
+                str(record.get("step_name", "unknown")),
+                str(record.get("prompt_mode", "unknown")),
+            )
+            grouped.setdefault(key, []).append(record)
+
+        step_rows = []
+        for (step_name, prompt_mode), rows in sorted(grouped.items()):
+            step_duration_ms = sum(float(row.get("duration_ms", 0.0)) for row in rows)
+            step_prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in rows)
+            step_completion_tokens = sum(
+                int(row.get("completion_tokens") or 0) for row in rows
+            )
+            step_rows.append(
+                {
+                    "step_name": step_name,
+                    "prompt_mode": prompt_mode,
+                    "request_count": len(rows),
+                    "total_duration_ms": step_duration_ms,
+                    "avg_duration_ms": step_duration_ms / len(rows),
+                    "total_prompt_tokens": step_prompt_tokens,
+                    "total_completion_tokens": step_completion_tokens,
+                    "avg_prompt_tokens": (
+                        step_prompt_tokens / len(rows) if rows else 0.0
+                    ),
+                    "duration_ms_per_1k_prompt_tokens": (
+                        step_duration_ms / (step_prompt_tokens / 1000.0)
+                        if step_prompt_tokens
+                        else 0.0
+                    ),
+                }
+            )
+
+        return {
+            "request_count": len(call_records),
+            "total_duration_ms": total_duration_ms,
+            "avg_duration_ms": total_duration_ms / len(call_records),
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_completion_tokens": total_completion_tokens,
+            "total_tokens": total_tokens,
+            "avg_prompt_tokens": total_prompt_tokens / len(call_records),
+            "duration_ms_per_1k_prompt_tokens": (
+                total_duration_ms / (total_prompt_tokens / 1000.0)
+                if total_prompt_tokens
+                else 0.0
+            ),
+            "step_rows": step_rows,
+        }
+
+    def _write_backend_call_records(
+        self,
+        *,
+        backend_call_path: Path,
+        workflow_id: str,
+        call_records: Sequence[Mapping[str, object]],
+    ) -> None:
+        backend_call_path.parent.mkdir(parents=True, exist_ok=True)
+        with backend_call_path.open("w", encoding="utf-8") as handle:
+            for record in call_records:
+                payload = {"workflow_id": workflow_id, **dict(record)}
+                handle.write(json.dumps(payload) + "\n")
 
     def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
         trace_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}.jsonl"
@@ -2023,6 +2162,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
 
         trace_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}.jsonl"
         runtime_event_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}_runtime.jsonl"
+        backend_call_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}_backend_calls.jsonl"
         selected_files = self._select_files(instance)
         self._reset_monolithic_prompt_runtime_state()
 
@@ -2725,11 +2865,18 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
         events = load_trace_events(trace_path)
         validation = validate_trace_events(events)
         runtime_summary = self._runtime_event_summary(materializer)
+        backend_call_records = self.backend.drain_call_records()
+        backend_call_summary = self._backend_call_summary(backend_call_records)
         self._write_runtime_events(
             materializer=materializer,
             runtime_event_path=runtime_event_path,
             workflow_id=instance.instance_id,
             agent_family="langgraph",
+        )
+        self._write_backend_call_records(
+            backend_call_path=backend_call_path,
+            workflow_id=instance.instance_id,
+            call_records=backend_call_records,
         )
         return {
             "instance_id": instance.instance_id,
@@ -2743,6 +2890,8 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             "trace_path": str(trace_path),
             "runtime_event_path": str(runtime_event_path),
             "runtime_event_summary": runtime_summary,
+            "backend_call_path": str(backend_call_path),
+            "backend_call_summary": backend_call_summary,
             "trace_validation": {
                 "is_valid": validation.is_valid,
                 "errors": validation.errors,

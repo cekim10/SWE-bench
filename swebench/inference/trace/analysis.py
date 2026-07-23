@@ -100,6 +100,14 @@ def load_runtime_events(path: str | Path) -> List[Dict[str, object]]:
     ]
 
 
+def load_backend_call_records(path: str | Path) -> List[Dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def summarize_run_output(path: str | Path) -> Dict[str, object]:
     records = load_run_output_records(path)
     provider_counts: Dict[str, int] = defaultdict(int)
@@ -107,6 +115,7 @@ def summarize_run_output(path: str | Path) -> Dict[str, object]:
     invalid_instance_ids = []
     missing_trace_path_count = 0
     runtime_event_path_count = 0
+    backend_call_path_count = 0
     for record in records:
         provider = str(record.get("provider", "unknown"))
         provider_counts[provider] += 1
@@ -119,6 +128,8 @@ def summarize_run_output(path: str | Path) -> Dict[str, object]:
             missing_trace_path_count += 1
         if record.get("runtime_event_path"):
             runtime_event_path_count += 1
+        if record.get("backend_call_path"):
+            backend_call_path_count += 1
 
     real_backend_trace_count = sum(
         count for provider, count in provider_counts.items() if provider != "stub"
@@ -130,6 +141,7 @@ def summarize_run_output(path: str | Path) -> Dict[str, object]:
         "invalid_instance_ids": invalid_instance_ids,
         "missing_trace_path_count": missing_trace_path_count,
         "runtime_event_path_count": runtime_event_path_count,
+        "backend_call_path_count": backend_call_path_count,
         "real_backend_trace_count": real_backend_trace_count,
         "stub_trace_count": provider_counts.get("stub", 0),
     }
@@ -705,11 +717,85 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
     }
 
 
+def analyze_backend_call_records(
+    records: Sequence[Mapping[str, object]],
+) -> Dict[str, object]:
+    if not records:
+        return _empty_backend_latency_summary()
+
+    total_duration_ms = sum(float(record.get("duration_ms", 0.0)) for record in records)
+    total_prompt_tokens = sum(int(record.get("prompt_tokens") or 0) for record in records)
+    total_completion_tokens = sum(
+        int(record.get("completion_tokens") or 0) for record in records
+    )
+    total_tokens = sum(int(record.get("total_tokens") or 0) for record in records)
+    grouped: Dict[tuple[str, str], List[Mapping[str, object]]] = defaultdict(list)
+    for record in records:
+        grouped[
+            (
+                str(record.get("step_name", "unknown")),
+                str(record.get("prompt_mode", "unknown")),
+            )
+        ].append(record)
+
+    step_rows = []
+    for (step_name, prompt_mode), step_records in sorted(grouped.items()):
+        step_duration_ms = sum(
+            float(record.get("duration_ms", 0.0)) for record in step_records
+        )
+        step_prompt_tokens = sum(
+            int(record.get("prompt_tokens") or 0) for record in step_records
+        )
+        step_completion_tokens = sum(
+            int(record.get("completion_tokens") or 0) for record in step_records
+        )
+        step_total_tokens = sum(
+            int(record.get("total_tokens") or 0) for record in step_records
+        )
+        step_rows.append(
+            {
+                "step_name": step_name,
+                "prompt_mode": prompt_mode,
+                "request_count": len(step_records),
+                "total_duration_ms": step_duration_ms,
+                "avg_duration_ms": step_duration_ms / len(step_records),
+                "total_prompt_tokens": step_prompt_tokens,
+                "total_completion_tokens": step_completion_tokens,
+                "total_tokens": step_total_tokens,
+                "avg_prompt_tokens": (
+                    step_prompt_tokens / len(step_records) if step_records else 0.0
+                ),
+                "duration_ms_per_1k_prompt_tokens": (
+                    step_duration_ms / (step_prompt_tokens / 1000.0)
+                    if step_prompt_tokens
+                    else 0.0
+                ),
+            }
+        )
+
+    return {
+        "request_count": len(records),
+        "total_duration_ms": total_duration_ms,
+        "avg_duration_ms": total_duration_ms / len(records),
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_completion_tokens": total_completion_tokens,
+        "total_tokens": total_tokens,
+        "avg_prompt_tokens": total_prompt_tokens / len(records),
+        "duration_ms_per_1k_prompt_tokens": (
+            total_duration_ms / (total_prompt_tokens / 1000.0)
+            if total_prompt_tokens
+            else 0.0
+        ),
+        "step_rows": step_rows,
+    }
+
+
 def analyze_trace_paths(
     trace_paths: Sequence[str | Path],
     *,
     trace_metadata_by_path: Mapping[str, Mapping[str, object]] | None = None,
     runtime_event_paths_by_trace_path: Mapping[str, str | Path] | None = None,
+    backend_call_paths_by_trace_path: Mapping[str, str | Path] | None = None,
     run_summary: Mapping[str, object] | None = None,
 ) -> Dict[str, object]:
     per_trace = {}
@@ -723,6 +809,12 @@ def analyze_trace_paths(
             if runtime_event_path:
                 analysis["runtime_behavior"] = analyze_runtime_events(
                     load_runtime_events(runtime_event_path)
+                )
+        if backend_call_paths_by_trace_path is not None:
+            backend_call_path = backend_call_paths_by_trace_path.get(resolved)
+            if backend_call_path:
+                analysis["backend_latency"] = analyze_backend_call_records(
+                    load_backend_call_records(backend_call_path)
                 )
         per_trace[resolved] = analysis
         analyses.append(analysis)
@@ -770,6 +862,7 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Stub traces: {run_summary['stub_trace_count']}",
                 f"- Missing trace paths: {run_summary['missing_trace_path_count']}",
                 f"- Runtime event logs: {run_summary.get('runtime_event_path_count', 0)}",
+                f"- Backend call logs: {run_summary.get('backend_call_path_count', 0)}",
                 "",
             ]
         )
@@ -963,6 +1056,34 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"| {row['role']} | {row['count']} | {row['avg_semantic_lifetime']:.2f} | "
                 f"{row['avg_registration_to_first_lookup']:.2f} | {row['avg_lookup_span']:.2f} | "
                 f"{row['registered_but_never_reused_ratio']:.2f} |"
+            )
+
+    backend_latency = aggregate.get("backend_latency")
+    if backend_latency is not None:
+        lines.extend(
+            [
+                "",
+                "## Request Latency",
+                "",
+                f"- Requests: {backend_latency['request_count']}",
+                f"- Total duration ms: {backend_latency['total_duration_ms']:.2f}",
+                f"- Average duration ms: {backend_latency['avg_duration_ms']:.2f}",
+                f"- Total prompt tokens: {backend_latency['total_prompt_tokens']}",
+                f"- Total completion tokens: {backend_latency['total_completion_tokens']}",
+                f"- Avg prompt tokens / request: {backend_latency['avg_prompt_tokens']:.2f}",
+                f"- Duration ms per 1k prompt tokens: {backend_latency['duration_ms_per_1k_prompt_tokens']:.2f}",
+                "",
+                "### By Step",
+                "",
+                "| Step | Prompt Mode | Requests | Avg Duration ms | Total Prompt Tokens | Avg Prompt Tokens | ms / 1k Prompt Tokens |",
+                "| - | - | -: | -: | -: | -: | -: |",
+            ]
+        )
+        for row in backend_latency["step_rows"]:
+            lines.append(
+                f"| {row['step_name']} | {row['prompt_mode']} | {row['request_count']} | "
+                f"{row['avg_duration_ms']:.2f} | {row['total_prompt_tokens']} | "
+                f"{row['avg_prompt_tokens']:.2f} | {row['duration_ms_per_1k_prompt_tokens']:.2f} |"
             )
 
     if "providers" in report:
@@ -1382,6 +1503,20 @@ def _empty_runtime_behavior_summary() -> Dict[str, object]:
     }
 
 
+def _empty_backend_latency_summary() -> Dict[str, object]:
+    return {
+        "request_count": 0,
+        "total_duration_ms": 0.0,
+        "avg_duration_ms": 0.0,
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0,
+        "total_tokens": 0,
+        "avg_prompt_tokens": 0.0,
+        "duration_ms_per_1k_prompt_tokens": 0.0,
+        "step_rows": [],
+    }
+
+
 def _legacy_bridge_alias(oracle_bridge: Mapping[str, object]) -> Dict[str, object]:
     return {
         "transition_count": int(oracle_bridge["transition_count"]),
@@ -1462,6 +1597,10 @@ def _coerce_oracle_bridge(analysis: Mapping[str, object]) -> Dict[str, object]:
 
 def _coerce_runtime_behavior(analysis: Mapping[str, object]) -> Dict[str, object]:
     return dict(analysis.get("runtime_behavior", _empty_runtime_behavior_summary()))
+
+
+def _coerce_backend_latency(analysis: Mapping[str, object]) -> Dict[str, object]:
+    return dict(analysis.get("backend_latency", _empty_backend_latency_summary()))
 
 
 def _aggregate_runtime_behaviors(
@@ -1703,6 +1842,94 @@ def _aggregate_runtime_behaviors(
     }
 
 
+def _aggregate_backend_latencies(
+    backend_latencies: Sequence[Mapping[str, object]],
+) -> Dict[str, object]:
+    if not backend_latencies:
+        return _empty_backend_latency_summary()
+
+    grouped: Dict[tuple[str, str], Dict[str, float | int | str]] = {}
+    for latency in backend_latencies:
+        for row in latency.get("step_rows", []):
+            key = (str(row["step_name"]), str(row["prompt_mode"]))
+            bucket = grouped.setdefault(
+                key,
+                {
+                    "step_name": key[0],
+                    "prompt_mode": key[1],
+                    "request_count": 0,
+                    "total_duration_ms": 0.0,
+                    "total_prompt_tokens": 0,
+                    "total_completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            )
+            bucket["request_count"] = int(bucket["request_count"]) + int(row["request_count"])
+            bucket["total_duration_ms"] = float(bucket["total_duration_ms"]) + float(
+                row["total_duration_ms"]
+            )
+            bucket["total_prompt_tokens"] = int(bucket["total_prompt_tokens"]) + int(
+                row["total_prompt_tokens"]
+            )
+            bucket["total_completion_tokens"] = int(
+                bucket["total_completion_tokens"]
+            ) + int(row["total_completion_tokens"])
+            bucket["total_tokens"] = int(bucket["total_tokens"]) + int(row["total_tokens"])
+
+    step_rows = []
+    for key in sorted(grouped):
+        bucket = grouped[key]
+        request_count = int(bucket["request_count"])
+        total_duration_ms = float(bucket["total_duration_ms"])
+        total_prompt_tokens = int(bucket["total_prompt_tokens"])
+        step_rows.append(
+            {
+                "step_name": bucket["step_name"],
+                "prompt_mode": bucket["prompt_mode"],
+                "request_count": request_count,
+                "total_duration_ms": total_duration_ms,
+                "avg_duration_ms": total_duration_ms / request_count if request_count else 0.0,
+                "total_prompt_tokens": total_prompt_tokens,
+                "total_completion_tokens": int(bucket["total_completion_tokens"]),
+                "total_tokens": int(bucket["total_tokens"]),
+                "avg_prompt_tokens": (
+                    total_prompt_tokens / request_count if request_count else 0.0
+                ),
+                "duration_ms_per_1k_prompt_tokens": (
+                    total_duration_ms / (total_prompt_tokens / 1000.0)
+                    if total_prompt_tokens
+                    else 0.0
+                ),
+            }
+        )
+
+    request_count = sum(int(latency["request_count"]) for latency in backend_latencies)
+    total_duration_ms = sum(float(latency["total_duration_ms"]) for latency in backend_latencies)
+    total_prompt_tokens = sum(int(latency["total_prompt_tokens"]) for latency in backend_latencies)
+    total_completion_tokens = sum(
+        int(latency["total_completion_tokens"]) for latency in backend_latencies
+    )
+    total_tokens = sum(int(latency["total_tokens"]) for latency in backend_latencies)
+
+    return {
+        "request_count": request_count,
+        "total_duration_ms": total_duration_ms,
+        "avg_duration_ms": total_duration_ms / request_count if request_count else 0.0,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_completion_tokens": total_completion_tokens,
+        "total_tokens": total_tokens,
+        "avg_prompt_tokens": (
+            total_prompt_tokens / request_count if request_count else 0.0
+        ),
+        "duration_ms_per_1k_prompt_tokens": (
+            total_duration_ms / (total_prompt_tokens / 1000.0)
+            if total_prompt_tokens
+            else 0.0
+        ),
+        "step_rows": step_rows,
+    }
+
+
 def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, object]:
     if not analyses:
         return {
@@ -1724,6 +1951,7 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
                 "lifetime_spread_per_prompt": [],
             },
             "runtime_behavior": _empty_runtime_behavior_summary(),
+            "backend_latency": _empty_backend_latency_summary(),
             "oracle_abstraction_bridge": _empty_oracle_bridge_summary(),
             "abstraction_bridge": _legacy_bridge_alias(_empty_oracle_bridge_summary()),
         }
@@ -1918,6 +2146,13 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
             if "runtime_behavior" in analysis
         ]
     )
+    backend_latency = _aggregate_backend_latencies(
+        [
+            _coerce_backend_latency(analysis)
+            for analysis in analyses
+            if "backend_latency" in analysis
+        ]
+    )
 
     return {
         "state_count": total_state_count,
@@ -1927,6 +2162,7 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
         "lifetime_correlation": lifetime_correlation,
         "abstraction_mismatch": mismatch,
         "runtime_behavior": runtime_behavior,
+        "backend_latency": backend_latency,
         "oracle_abstraction_bridge": oracle_abstraction_bridge,
         "abstraction_bridge": _legacy_bridge_alias(oracle_abstraction_bridge),
     }

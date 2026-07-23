@@ -43,6 +43,7 @@ def filtered_run_summary(records: List[Mapping[str, object]]) -> Dict[str, objec
     invalid_instance_ids = []
     missing_trace_path_count = 0
     runtime_event_path_count = 0
+    backend_call_path_count = 0
     for record in records:
         provider = str(record.get("provider", "unknown"))
         provider_counts[provider] = provider_counts.get(provider, 0) + 1
@@ -55,6 +56,8 @@ def filtered_run_summary(records: List[Mapping[str, object]]) -> Dict[str, objec
             missing_trace_path_count += 1
         if record.get("runtime_event_path"):
             runtime_event_path_count += 1
+        if record.get("backend_call_path"):
+            backend_call_path_count += 1
     real_backend_trace_count = sum(
         count for provider, count in provider_counts.items() if provider != "stub"
     )
@@ -65,6 +68,7 @@ def filtered_run_summary(records: List[Mapping[str, object]]) -> Dict[str, objec
         "invalid_instance_ids": invalid_instance_ids,
         "missing_trace_path_count": missing_trace_path_count,
         "runtime_event_path_count": runtime_event_path_count,
+        "backend_call_path_count": backend_call_path_count,
         "real_backend_trace_count": real_backend_trace_count,
         "stub_trace_count": provider_counts.get("stub", 0),
     }
@@ -100,6 +104,21 @@ def build_runtime_event_metadata(
     return metadata
 
 
+def build_backend_call_metadata(
+    records: Iterable[Mapping[str, object]],
+) -> Dict[str, str]:
+    metadata: Dict[str, str] = {}
+    for record in records:
+        trace_path = record.get("trace_path")
+        backend_call_path = record.get("backend_call_path")
+        if not trace_path or not backend_call_path:
+            continue
+        metadata[str(Path(str(trace_path)).resolve())] = str(
+            Path(str(backend_call_path)).resolve()
+        )
+    return metadata
+
+
 def build_matched_report(
     *,
     left_run_output_path: str | Path,
@@ -118,12 +137,14 @@ def build_matched_report(
         [record["trace_path"] for record in left_subset],
         trace_metadata_by_path=build_trace_metadata(left_subset),
         runtime_event_paths_by_trace_path=build_runtime_event_metadata(left_subset),
+        backend_call_paths_by_trace_path=build_backend_call_metadata(left_subset),
         run_summary=filtered_run_summary(left_subset),
     )
     right_report = analyze_trace_paths(
         [record["trace_path"] for record in right_subset],
         trace_metadata_by_path=build_trace_metadata(right_subset),
         runtime_event_paths_by_trace_path=build_runtime_event_metadata(right_subset),
+        backend_call_paths_by_trace_path=build_backend_call_metadata(right_subset),
         run_summary=filtered_run_summary(right_subset),
     )
 
@@ -133,6 +154,8 @@ def build_matched_report(
     right_bridge = right_report["aggregate"]["oracle_abstraction_bridge"]
     left_runtime = left_report["aggregate"].get("runtime_behavior")
     right_runtime = right_report["aggregate"].get("runtime_behavior")
+    left_latency = left_report["aggregate"].get("backend_latency")
+    right_latency = right_report["aggregate"].get("backend_latency")
 
     comparison = {
         "matched_trace_count": len(matched_ids),
@@ -175,6 +198,19 @@ def build_matched_report(
                 - right_runtime["policy_reclaims"],
             }
         )
+    if left_latency is not None and right_latency is not None:
+        comparison["left_minus_right"].update(
+            {
+                "avg_duration_ms": left_latency["avg_duration_ms"]
+                - right_latency["avg_duration_ms"],
+                "duration_ms_per_1k_prompt_tokens": left_latency[
+                    "duration_ms_per_1k_prompt_tokens"
+                ]
+                - right_latency["duration_ms_per_1k_prompt_tokens"],
+                "total_prompt_tokens": left_latency["total_prompt_tokens"]
+                - right_latency["total_prompt_tokens"],
+            }
+        )
 
     return {
         "left_label": left_label,
@@ -201,6 +237,8 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
     right_bridge = right_agg["oracle_abstraction_bridge"]
     left_runtime = left_agg.get("runtime_behavior")
     right_runtime = right_agg.get("runtime_behavior")
+    left_latency = left_agg.get("backend_latency")
+    right_latency = right_agg.get("backend_latency")
 
     rows = [
         (
@@ -302,6 +340,34 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
             ]
         )
         for metric, left_value, right_value in runtime_rows:
+            delta = left_value - right_value
+            if isinstance(left_value, float) or isinstance(right_value, float):
+                lines.append(
+                    f"| {metric} | {left_value:.4f} | {right_value:.4f} | {delta:.4f} |"
+                )
+            else:
+                lines.append(f"| {metric} | {left_value} | {right_value} | {delta} |")
+
+    if left_latency is not None and right_latency is not None:
+        latency_rows = [
+            ("Avg duration ms", left_latency["avg_duration_ms"], right_latency["avg_duration_ms"]),
+            (
+                "ms per 1k prompt tokens",
+                left_latency["duration_ms_per_1k_prompt_tokens"],
+                right_latency["duration_ms_per_1k_prompt_tokens"],
+            ),
+            ("Total prompt tokens", left_latency["total_prompt_tokens"], right_latency["total_prompt_tokens"]),
+        ]
+        lines.extend(
+            [
+                "",
+                "## Request Latency",
+                "",
+                "| Metric | Left | Right | Left-Right |",
+                "| - | -: | -: | -: |",
+            ]
+        )
+        for metric, left_value, right_value in latency_rows:
             delta = left_value - right_value
             if isinstance(left_value, float) or isinstance(right_value, float):
                 lines.append(
