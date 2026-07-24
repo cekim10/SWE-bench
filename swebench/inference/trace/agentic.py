@@ -6,6 +6,7 @@ import importlib.util
 import math
 import os
 import re
+import time
 from hashlib import sha256
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +60,52 @@ def _load_langgraph_symbols():
 
 def approx_token_count(text: str) -> int:
     return max(1, math.ceil(len(text) / 4))
+
+
+def _segment_token_sum(segments: Sequence[ContextSegment] | None) -> int:
+    return sum(segment.token_count for segment in segments or ())
+
+
+def _prompt_metrics(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    segment_request: SegmentedGenerationRequest | None,
+    messages: Sequence[Mapping[str, str]],
+    prompt_tokens_override: int | None = None,
+) -> Dict[str, int]:
+    system_prompt_tokens_estimate = approx_token_count(system_prompt)
+    user_prompt_tokens_estimate = approx_token_count(user_prompt)
+    ordered_segment_tokens = _segment_token_sum(
+        segment_request.ordered_segments if segment_request is not None else ()
+    )
+    request_segment_tokens = _segment_token_sum(
+        segment_request.request_segments if segment_request is not None else ()
+    )
+    assembled_prompt_tokens_estimate = sum(
+        approx_token_count(str(message.get("content", ""))) for message in messages
+    )
+    prompt_tokens = (
+        int(prompt_tokens_override)
+        if prompt_tokens_override is not None
+        else assembled_prompt_tokens_estimate
+    )
+    prompt_payload_tokens_estimate = (
+        system_prompt_tokens_estimate + user_prompt_tokens_estimate + request_segment_tokens
+    )
+    duplicate_prompt_tokens_estimate = max(
+        0, prompt_tokens - prompt_payload_tokens_estimate
+    )
+    return {
+        "system_prompt_tokens_estimate": system_prompt_tokens_estimate,
+        "user_prompt_tokens_estimate": user_prompt_tokens_estimate,
+        "ordered_segment_tokens": ordered_segment_tokens,
+        "request_segment_tokens": request_segment_tokens,
+        "assembled_prompt_tokens_estimate": assembled_prompt_tokens_estimate,
+        "prompt_tokens": prompt_tokens,
+        "prompt_payload_tokens_estimate": prompt_payload_tokens_estimate,
+        "duplicate_prompt_tokens_estimate": duplicate_prompt_tokens_estimate,
+    }
 
 
 def size_bytes(text: str) -> int:
@@ -232,6 +279,8 @@ class StubModelBackend:
         segment_request: SegmentedGenerationRequest | None = None,
         materializer_snapshot: RuntimeResidencySnapshot | None = None,
     ) -> str:
+        call_started_at = time.perf_counter()
+        message_build_started_at = time.perf_counter()
         messages = (
             segment_request.to_openai_messages(fallback_system_prompt=system_prompt)
             if prompt_mode == "segment_aware" and segment_request is not None
@@ -240,13 +289,19 @@ class StubModelBackend:
                 {"role": "user", "content": user_prompt},
             ]
         )
-        assembled_prompt_tokens_estimate = sum(
-            approx_token_count(message["content"]) for message in messages
+        frontend_message_build_ms = (
+            time.perf_counter() - message_build_started_at
+        ) * 1000.0
+        prompt_metrics_started_at = time.perf_counter()
+        prompt_metrics = _prompt_metrics(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            segment_request=segment_request,
+            messages=messages,
         )
-        request_segment_tokens = sum(
-            segment.token_count for segment in (segment_request.request_segments if segment_request is not None else ())
-        )
-        prompt_tokens = sum(approx_token_count(message["content"]) for message in messages)
+        frontend_token_estimate_ms = (
+            time.perf_counter() - prompt_metrics_started_at
+        ) * 1000.0
         if step_name == "planner":
             text = (
                 f"Plan v{iteration}:\n"
@@ -295,14 +350,21 @@ class StubModelBackend:
             raise ValueError(f"unknown step_name {step_name!r}")
 
         completion_tokens = approx_token_count(text)
+        total_duration_ms = (time.perf_counter() - call_started_at) * 1000.0
         self._call_records.append(
             {
                 "step_name": step_name,
                 "prompt_mode": prompt_mode,
-                "duration_ms": 0.0,
-                "prompt_tokens": prompt_tokens,
+                "duration_ms": total_duration_ms,
+                "backend_roundtrip_ms": 0.0,
+                "frontend_message_build_ms": frontend_message_build_ms,
+                "frontend_token_estimate_ms": frontend_token_estimate_ms,
+                "frontend_overhead_ms": (
+                    frontend_message_build_ms + frontend_token_estimate_ms
+                ),
+                "prompt_tokens": prompt_metrics["prompt_tokens"],
                 "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
+                "total_tokens": prompt_metrics["prompt_tokens"] + completion_tokens,
                 "segment_group_id": prompt_group.group_id if prompt_group is not None else None,
                 "segment_count": (
                     len(segment_request.ordered_segments) if segment_request is not None else 0
@@ -313,15 +375,19 @@ class StubModelBackend:
                 "request_segment_count": (
                     len(segment_request.request_segments) if segment_request is not None else 0
                 ),
-                "system_prompt_tokens_estimate": approx_token_count(system_prompt),
-                "user_prompt_tokens_estimate": approx_token_count(user_prompt),
-                "ordered_segment_tokens": (
-                    sum(segment.token_count for segment in segment_request.ordered_segments)
-                    if segment_request is not None
-                    else 0
-                ),
-                "request_segment_tokens": request_segment_tokens,
-                "assembled_prompt_tokens_estimate": assembled_prompt_tokens_estimate,
+                "system_prompt_tokens_estimate": prompt_metrics["system_prompt_tokens_estimate"],
+                "user_prompt_tokens_estimate": prompt_metrics["user_prompt_tokens_estimate"],
+                "ordered_segment_tokens": prompt_metrics["ordered_segment_tokens"],
+                "request_segment_tokens": prompt_metrics["request_segment_tokens"],
+                "assembled_prompt_tokens_estimate": prompt_metrics[
+                    "assembled_prompt_tokens_estimate"
+                ],
+                "prompt_payload_tokens_estimate": prompt_metrics[
+                    "prompt_payload_tokens_estimate"
+                ],
+                "duplicate_prompt_tokens_estimate": prompt_metrics[
+                    "duplicate_prompt_tokens_estimate"
+                ],
                 "runtime_hbm_bytes": (
                     materializer_snapshot.hbm_bytes
                     if materializer_snapshot is not None
@@ -506,6 +572,7 @@ class VLLMServerChatBackend:
         segment_request: SegmentedGenerationRequest | None = None,
         materializer_snapshot: RuntimeResidencySnapshot | None = None,
     ) -> str:
+        call_started_at = time.perf_counter()
         request = VLLMBackendRequest(
             model=self.model,
             system_prompt=system_prompt,
@@ -553,6 +620,7 @@ class VLLMServerChatBackend:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        message_build_started_at = time.perf_counter()
         cached_messages = self._message_cache.get(request_key)
         if cached_messages is None:
             cached_messages = tuple(
@@ -570,20 +638,35 @@ class VLLMServerChatBackend:
             extra_body=request.extra_body,
             messages_override=cached_messages,
         )
+        frontend_message_build_ms = (
+            time.perf_counter() - message_build_started_at
+        ) * 1000.0
         result = self.adapter.complete_with_details(request)
-        assembled_prompt_tokens_estimate = sum(
-            approx_token_count(content) for _, content in cached_messages
+        prompt_metrics_started_at = time.perf_counter()
+        prompt_metrics = _prompt_metrics(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            segment_request=segment_request,
+            messages=[
+                {"role": role, "content": content} for role, content in cached_messages
+            ],
+            prompt_tokens_override=result.prompt_tokens,
         )
-        request_segment_tokens = (
-            sum(segment.token_count for segment in segment_request.request_segments)
-            if segment_request is not None
-            else 0
-        )
+        frontend_token_estimate_ms = (
+            time.perf_counter() - prompt_metrics_started_at
+        ) * 1000.0
+        total_duration_ms = (time.perf_counter() - call_started_at) * 1000.0
         self._call_records.append(
             {
                 "step_name": step_name,
                 "prompt_mode": prompt_mode,
-                "duration_ms": result.duration_ms,
+                "duration_ms": total_duration_ms,
+                "backend_roundtrip_ms": result.duration_ms,
+                "frontend_message_build_ms": frontend_message_build_ms,
+                "frontend_token_estimate_ms": frontend_token_estimate_ms,
+                "frontend_overhead_ms": (
+                    frontend_message_build_ms + frontend_token_estimate_ms
+                ),
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.completion_tokens,
                 "total_tokens": result.total_tokens,
@@ -604,15 +687,19 @@ class VLLMServerChatBackend:
                     if segment_request is not None
                     else 0
                 ),
-                "system_prompt_tokens_estimate": approx_token_count(system_prompt),
-                "user_prompt_tokens_estimate": approx_token_count(user_prompt),
-                "ordered_segment_tokens": (
-                    sum(segment.token_count for segment in segment_request.ordered_segments)
-                    if segment_request is not None
-                    else 0
-                ),
-                "request_segment_tokens": request_segment_tokens,
-                "assembled_prompt_tokens_estimate": assembled_prompt_tokens_estimate,
+                "system_prompt_tokens_estimate": prompt_metrics["system_prompt_tokens_estimate"],
+                "user_prompt_tokens_estimate": prompt_metrics["user_prompt_tokens_estimate"],
+                "ordered_segment_tokens": prompt_metrics["ordered_segment_tokens"],
+                "request_segment_tokens": prompt_metrics["request_segment_tokens"],
+                "assembled_prompt_tokens_estimate": prompt_metrics[
+                    "assembled_prompt_tokens_estimate"
+                ],
+                "prompt_payload_tokens_estimate": prompt_metrics[
+                    "prompt_payload_tokens_estimate"
+                ],
+                "duplicate_prompt_tokens_estimate": prompt_metrics[
+                    "duplicate_prompt_tokens_estimate"
+                ],
                 "runtime_hbm_bytes": (
                     materializer_snapshot.hbm_bytes
                     if materializer_snapshot is not None
@@ -1299,6 +1386,14 @@ class TracedAgentRunner:
                 "request_count": 0,
                 "total_duration_ms": 0.0,
                 "avg_duration_ms": 0.0,
+                "total_backend_roundtrip_ms": 0.0,
+                "avg_backend_roundtrip_ms": 0.0,
+                "total_frontend_message_build_ms": 0.0,
+                "avg_frontend_message_build_ms": 0.0,
+                "total_frontend_token_estimate_ms": 0.0,
+                "avg_frontend_token_estimate_ms": 0.0,
+                "total_frontend_overhead_ms": 0.0,
+                "avg_frontend_overhead_ms": 0.0,
                 "total_prompt_tokens": 0,
                 "total_completion_tokens": 0,
                 "total_tokens": 0,
@@ -1311,10 +1406,24 @@ class TracedAgentRunner:
                 "total_ordered_segment_tokens": 0,
                 "total_request_segment_tokens": 0,
                 "total_assembled_prompt_tokens_estimate": 0,
+                "total_prompt_payload_tokens_estimate": 0,
+                "total_duplicate_prompt_tokens_estimate": 0,
                 "step_rows": [],
             }
 
         total_duration_ms = sum(float(record.get("duration_ms", 0.0)) for record in call_records)
+        total_backend_roundtrip_ms = sum(
+            float(record.get("backend_roundtrip_ms", 0.0)) for record in call_records
+        )
+        total_frontend_message_build_ms = sum(
+            float(record.get("frontend_message_build_ms", 0.0)) for record in call_records
+        )
+        total_frontend_token_estimate_ms = sum(
+            float(record.get("frontend_token_estimate_ms", 0.0)) for record in call_records
+        )
+        total_frontend_overhead_ms = sum(
+            float(record.get("frontend_overhead_ms", 0.0)) for record in call_records
+        )
         total_prompt_tokens = sum(int(record.get("prompt_tokens") or 0) for record in call_records)
         total_completion_tokens = sum(
             int(record.get("completion_tokens") or 0) for record in call_records
@@ -1338,6 +1447,12 @@ class TracedAgentRunner:
         total_assembled_prompt_tokens_estimate = sum(
             int(record.get("assembled_prompt_tokens_estimate") or 0) for record in call_records
         )
+        total_prompt_payload_tokens_estimate = sum(
+            int(record.get("prompt_payload_tokens_estimate") or 0) for record in call_records
+        )
+        total_duplicate_prompt_tokens_estimate = sum(
+            int(record.get("duplicate_prompt_tokens_estimate") or 0) for record in call_records
+        )
         grouped: Dict[tuple[str, str], List[Mapping[str, object]]] = {}
         for record in call_records:
             key = (
@@ -1349,6 +1464,18 @@ class TracedAgentRunner:
         step_rows = []
         for (step_name, prompt_mode), rows in sorted(grouped.items()):
             step_duration_ms = sum(float(row.get("duration_ms", 0.0)) for row in rows)
+            step_backend_roundtrip_ms = sum(
+                float(row.get("backend_roundtrip_ms", 0.0)) for row in rows
+            )
+            step_frontend_message_build_ms = sum(
+                float(row.get("frontend_message_build_ms", 0.0)) for row in rows
+            )
+            step_frontend_token_estimate_ms = sum(
+                float(row.get("frontend_token_estimate_ms", 0.0)) for row in rows
+            )
+            step_frontend_overhead_ms = sum(
+                float(row.get("frontend_overhead_ms", 0.0)) for row in rows
+            )
             step_prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in rows)
             step_completion_tokens = sum(
                 int(row.get("completion_tokens") or 0) for row in rows
@@ -1371,6 +1498,12 @@ class TracedAgentRunner:
             step_assembled_prompt_tokens_estimate = sum(
                 int(row.get("assembled_prompt_tokens_estimate") or 0) for row in rows
             )
+            step_prompt_payload_tokens_estimate = sum(
+                int(row.get("prompt_payload_tokens_estimate") or 0) for row in rows
+            )
+            step_duplicate_prompt_tokens_estimate = sum(
+                int(row.get("duplicate_prompt_tokens_estimate") or 0) for row in rows
+            )
             step_rows.append(
                 {
                     "step_name": step_name,
@@ -1378,6 +1511,16 @@ class TracedAgentRunner:
                     "request_count": len(rows),
                     "total_duration_ms": step_duration_ms,
                     "avg_duration_ms": step_duration_ms / len(rows),
+                    "total_backend_roundtrip_ms": step_backend_roundtrip_ms,
+                    "avg_backend_roundtrip_ms": step_backend_roundtrip_ms / len(rows),
+                    "total_frontend_message_build_ms": step_frontend_message_build_ms,
+                    "avg_frontend_message_build_ms": step_frontend_message_build_ms / len(rows),
+                    "total_frontend_token_estimate_ms": step_frontend_token_estimate_ms,
+                    "avg_frontend_token_estimate_ms": (
+                        step_frontend_token_estimate_ms / len(rows)
+                    ),
+                    "total_frontend_overhead_ms": step_frontend_overhead_ms,
+                    "avg_frontend_overhead_ms": step_frontend_overhead_ms / len(rows),
                     "total_prompt_tokens": step_prompt_tokens,
                     "total_completion_tokens": step_completion_tokens,
                     "avg_prompt_tokens": (
@@ -1397,6 +1540,8 @@ class TracedAgentRunner:
                     "ordered_segment_tokens": step_ordered_segment_tokens,
                     "request_segment_tokens": step_request_segment_tokens,
                     "assembled_prompt_tokens_estimate": step_assembled_prompt_tokens_estimate,
+                    "prompt_payload_tokens_estimate": step_prompt_payload_tokens_estimate,
+                    "duplicate_prompt_tokens_estimate": step_duplicate_prompt_tokens_estimate,
                 }
             )
 
@@ -1404,6 +1549,18 @@ class TracedAgentRunner:
             "request_count": len(call_records),
             "total_duration_ms": total_duration_ms,
             "avg_duration_ms": total_duration_ms / len(call_records),
+            "total_backend_roundtrip_ms": total_backend_roundtrip_ms,
+            "avg_backend_roundtrip_ms": total_backend_roundtrip_ms / len(call_records),
+            "total_frontend_message_build_ms": total_frontend_message_build_ms,
+            "avg_frontend_message_build_ms": (
+                total_frontend_message_build_ms / len(call_records)
+            ),
+            "total_frontend_token_estimate_ms": total_frontend_token_estimate_ms,
+            "avg_frontend_token_estimate_ms": (
+                total_frontend_token_estimate_ms / len(call_records)
+            ),
+            "total_frontend_overhead_ms": total_frontend_overhead_ms,
+            "avg_frontend_overhead_ms": total_frontend_overhead_ms / len(call_records),
             "total_prompt_tokens": total_prompt_tokens,
             "total_completion_tokens": total_completion_tokens,
             "total_tokens": total_tokens,
@@ -1420,6 +1577,8 @@ class TracedAgentRunner:
             "total_ordered_segment_tokens": total_ordered_segment_tokens,
             "total_request_segment_tokens": total_request_segment_tokens,
             "total_assembled_prompt_tokens_estimate": total_assembled_prompt_tokens_estimate,
+            "total_prompt_payload_tokens_estimate": total_prompt_payload_tokens_estimate,
+            "total_duplicate_prompt_tokens_estimate": total_duplicate_prompt_tokens_estimate,
             "step_rows": step_rows,
         }
 

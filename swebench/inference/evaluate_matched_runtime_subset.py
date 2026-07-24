@@ -203,12 +203,24 @@ def build_matched_report(
             {
                 "avg_duration_ms": left_latency["avg_duration_ms"]
                 - right_latency["avg_duration_ms"],
+                "avg_backend_roundtrip_ms": left_latency["avg_backend_roundtrip_ms"]
+                - right_latency["avg_backend_roundtrip_ms"],
+                "avg_frontend_overhead_ms": left_latency["avg_frontend_overhead_ms"]
+                - right_latency["avg_frontend_overhead_ms"],
                 "duration_ms_per_1k_prompt_tokens": left_latency[
                     "duration_ms_per_1k_prompt_tokens"
                 ]
                 - right_latency["duration_ms_per_1k_prompt_tokens"],
                 "total_prompt_tokens": left_latency["total_prompt_tokens"]
                 - right_latency["total_prompt_tokens"],
+                "total_prompt_payload_tokens_estimate": left_latency[
+                    "total_prompt_payload_tokens_estimate"
+                ]
+                - right_latency["total_prompt_payload_tokens_estimate"],
+                "total_duplicate_prompt_tokens_estimate": left_latency[
+                    "total_duplicate_prompt_tokens_estimate"
+                ]
+                - right_latency["total_duplicate_prompt_tokens_estimate"],
             }
         )
         comparison["prompt_token_inflation"] = (
@@ -357,11 +369,31 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
         latency_rows = [
             ("Avg duration ms", left_latency["avg_duration_ms"], right_latency["avg_duration_ms"]),
             (
+                "Avg backend round-trip ms",
+                left_latency["avg_backend_roundtrip_ms"],
+                right_latency["avg_backend_roundtrip_ms"],
+            ),
+            (
+                "Avg frontend overhead ms",
+                left_latency["avg_frontend_overhead_ms"],
+                right_latency["avg_frontend_overhead_ms"],
+            ),
+            (
                 "ms per 1k prompt tokens",
                 left_latency["duration_ms_per_1k_prompt_tokens"],
                 right_latency["duration_ms_per_1k_prompt_tokens"],
             ),
             ("Total prompt tokens", left_latency["total_prompt_tokens"], right_latency["total_prompt_tokens"]),
+            (
+                "Prompt payload tokens (est.)",
+                left_latency["total_prompt_payload_tokens_estimate"],
+                right_latency["total_prompt_payload_tokens_estimate"],
+            ),
+            (
+                "Duplicate prompt tokens (est.)",
+                left_latency["total_duplicate_prompt_tokens_estimate"],
+                right_latency["total_duplicate_prompt_tokens_estimate"],
+            ),
             (
                 "Frontend cache hit rate",
                 left_latency["frontend_cache_hit_rate"],

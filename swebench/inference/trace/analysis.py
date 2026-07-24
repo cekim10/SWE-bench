@@ -724,6 +724,18 @@ def analyze_backend_call_records(
         return _empty_backend_latency_summary()
 
     total_duration_ms = sum(float(record.get("duration_ms", 0.0)) for record in records)
+    total_backend_roundtrip_ms = sum(
+        float(record.get("backend_roundtrip_ms", 0.0)) for record in records
+    )
+    total_frontend_message_build_ms = sum(
+        float(record.get("frontend_message_build_ms", 0.0)) for record in records
+    )
+    total_frontend_token_estimate_ms = sum(
+        float(record.get("frontend_token_estimate_ms", 0.0)) for record in records
+    )
+    total_frontend_overhead_ms = sum(
+        float(record.get("frontend_overhead_ms", 0.0)) for record in records
+    )
     total_prompt_tokens = sum(int(record.get("prompt_tokens") or 0) for record in records)
     total_completion_tokens = sum(
         int(record.get("completion_tokens") or 0) for record in records
@@ -747,6 +759,12 @@ def analyze_backend_call_records(
     total_assembled_prompt_tokens_estimate = sum(
         int(record.get("assembled_prompt_tokens_estimate") or 0) for record in records
     )
+    total_prompt_payload_tokens_estimate = sum(
+        int(record.get("prompt_payload_tokens_estimate") or 0) for record in records
+    )
+    total_duplicate_prompt_tokens_estimate = sum(
+        int(record.get("duplicate_prompt_tokens_estimate") or 0) for record in records
+    )
     grouped: Dict[tuple[str, str], List[Mapping[str, object]]] = defaultdict(list)
     for record in records:
         grouped[
@@ -760,6 +778,20 @@ def analyze_backend_call_records(
     for (step_name, prompt_mode), step_records in sorted(grouped.items()):
         step_duration_ms = sum(
             float(record.get("duration_ms", 0.0)) for record in step_records
+        )
+        step_backend_roundtrip_ms = sum(
+            float(record.get("backend_roundtrip_ms", 0.0)) for record in step_records
+        )
+        step_frontend_message_build_ms = sum(
+            float(record.get("frontend_message_build_ms", 0.0))
+            for record in step_records
+        )
+        step_frontend_token_estimate_ms = sum(
+            float(record.get("frontend_token_estimate_ms", 0.0))
+            for record in step_records
+        )
+        step_frontend_overhead_ms = sum(
+            float(record.get("frontend_overhead_ms", 0.0)) for record in step_records
         )
         step_prompt_tokens = sum(
             int(record.get("prompt_tokens") or 0) for record in step_records
@@ -788,6 +820,12 @@ def analyze_backend_call_records(
         step_assembled_prompt_tokens_estimate = sum(
             int(record.get("assembled_prompt_tokens_estimate") or 0) for record in step_records
         )
+        step_prompt_payload_tokens_estimate = sum(
+            int(record.get("prompt_payload_tokens_estimate") or 0) for record in step_records
+        )
+        step_duplicate_prompt_tokens_estimate = sum(
+            int(record.get("duplicate_prompt_tokens_estimate") or 0) for record in step_records
+        )
         step_rows.append(
             {
                 "step_name": step_name,
@@ -795,6 +833,17 @@ def analyze_backend_call_records(
                 "request_count": len(step_records),
                 "total_duration_ms": step_duration_ms,
                 "avg_duration_ms": step_duration_ms / len(step_records),
+                "total_backend_roundtrip_ms": step_backend_roundtrip_ms,
+                "avg_backend_roundtrip_ms": step_backend_roundtrip_ms / len(step_records),
+                "total_frontend_message_build_ms": step_frontend_message_build_ms,
+                "avg_frontend_message_build_ms": step_frontend_message_build_ms
+                / len(step_records),
+                "total_frontend_token_estimate_ms": step_frontend_token_estimate_ms,
+                "avg_frontend_token_estimate_ms": step_frontend_token_estimate_ms
+                / len(step_records),
+                "total_frontend_overhead_ms": step_frontend_overhead_ms,
+                "avg_frontend_overhead_ms": step_frontend_overhead_ms
+                / len(step_records),
                 "total_prompt_tokens": step_prompt_tokens,
                 "total_completion_tokens": step_completion_tokens,
                 "total_tokens": step_total_tokens,
@@ -815,6 +864,8 @@ def analyze_backend_call_records(
                 "ordered_segment_tokens": step_ordered_segment_tokens,
                 "request_segment_tokens": step_request_segment_tokens,
                 "assembled_prompt_tokens_estimate": step_assembled_prompt_tokens_estimate,
+                "prompt_payload_tokens_estimate": step_prompt_payload_tokens_estimate,
+                "duplicate_prompt_tokens_estimate": step_duplicate_prompt_tokens_estimate,
             }
         )
 
@@ -822,6 +873,14 @@ def analyze_backend_call_records(
         "request_count": len(records),
         "total_duration_ms": total_duration_ms,
         "avg_duration_ms": total_duration_ms / len(records),
+        "total_backend_roundtrip_ms": total_backend_roundtrip_ms,
+        "avg_backend_roundtrip_ms": total_backend_roundtrip_ms / len(records),
+        "total_frontend_message_build_ms": total_frontend_message_build_ms,
+        "avg_frontend_message_build_ms": total_frontend_message_build_ms / len(records),
+        "total_frontend_token_estimate_ms": total_frontend_token_estimate_ms,
+        "avg_frontend_token_estimate_ms": total_frontend_token_estimate_ms / len(records),
+        "total_frontend_overhead_ms": total_frontend_overhead_ms,
+        "avg_frontend_overhead_ms": total_frontend_overhead_ms / len(records),
         "total_prompt_tokens": total_prompt_tokens,
         "total_completion_tokens": total_completion_tokens,
         "total_tokens": total_tokens,
@@ -838,6 +897,8 @@ def analyze_backend_call_records(
         "total_ordered_segment_tokens": total_ordered_segment_tokens,
         "total_request_segment_tokens": total_request_segment_tokens,
         "total_assembled_prompt_tokens_estimate": total_assembled_prompt_tokens_estimate,
+        "total_prompt_payload_tokens_estimate": total_prompt_payload_tokens_estimate,
+        "total_duplicate_prompt_tokens_estimate": total_duplicate_prompt_tokens_estimate,
         "step_rows": step_rows,
     }
 
@@ -1120,6 +1181,10 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Requests: {backend_latency['request_count']}",
                 f"- Total duration ms: {backend_latency['total_duration_ms']:.2f}",
                 f"- Average duration ms: {backend_latency['avg_duration_ms']:.2f}",
+                f"- Backend round-trip ms: {backend_latency['total_backend_roundtrip_ms']:.2f}",
+                f"- Frontend message-build ms: {backend_latency['total_frontend_message_build_ms']:.2f}",
+                f"- Frontend token-estimate ms: {backend_latency['total_frontend_token_estimate_ms']:.2f}",
+                f"- Frontend overhead ms: {backend_latency['total_frontend_overhead_ms']:.2f}",
                 f"- Total prompt tokens: {backend_latency['total_prompt_tokens']}",
                 f"- Total completion tokens: {backend_latency['total_completion_tokens']}",
                 f"- Avg prompt tokens / request: {backend_latency['avg_prompt_tokens']:.2f}",
@@ -1130,19 +1195,23 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Ordered segment tokens: {backend_latency['total_ordered_segment_tokens']}",
                 f"- Request segment tokens: {backend_latency['total_request_segment_tokens']}",
                 f"- Assembled prompt tokens (est.): {backend_latency['total_assembled_prompt_tokens_estimate']}",
+                f"- Prompt payload tokens (est.): {backend_latency['total_prompt_payload_tokens_estimate']}",
+                f"- Duplicate prompt tokens (est.): {backend_latency['total_duplicate_prompt_tokens_estimate']}",
                 "",
                 "### By Step",
                 "",
-                "| Step | Prompt Mode | Requests | Avg Duration ms | Total Prompt Tokens | User Tokens | Request Segment Tokens | Assembled Tokens (est.) | ms / 1k Prompt Tokens | Frontend Cache Hit Rate |",
-                "| - | - | -: | -: | -: | -: | -: | -: | -: | -: |",
+                "| Step | Prompt Mode | Requests | Avg Duration ms | Frontend Overhead ms | Backend Round-trip ms | Total Prompt Tokens | User Tokens | Request Segment Tokens | Duplicate Tokens (est.) | Assembled Tokens (est.) | ms / 1k Prompt Tokens | Frontend Cache Hit Rate |",
+                "| - | - | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: |",
             ]
         )
         for row in backend_latency["step_rows"]:
             lines.append(
                 f"| {row['step_name']} | {row['prompt_mode']} | {row['request_count']} | "
-                f"{row['avg_duration_ms']:.2f} | {row['total_prompt_tokens']} | "
+                f"{row['avg_duration_ms']:.2f} | {row['avg_frontend_overhead_ms']:.2f} | "
+                f"{row['avg_backend_roundtrip_ms']:.2f} | {row['total_prompt_tokens']} | "
                 f"{row['user_prompt_tokens_estimate']} | {row['request_segment_tokens']} | "
-                f"{row['assembled_prompt_tokens_estimate']} | {row['duration_ms_per_1k_prompt_tokens']:.2f} | "
+                f"{row['duplicate_prompt_tokens_estimate']} | {row['assembled_prompt_tokens_estimate']} | "
+                f"{row['duration_ms_per_1k_prompt_tokens']:.2f} | "
                 f"{row['frontend_cache_hit_rate']:.2f} |"
             )
 
@@ -1568,6 +1637,14 @@ def _empty_backend_latency_summary() -> Dict[str, object]:
         "request_count": 0,
         "total_duration_ms": 0.0,
         "avg_duration_ms": 0.0,
+        "total_backend_roundtrip_ms": 0.0,
+        "avg_backend_roundtrip_ms": 0.0,
+        "total_frontend_message_build_ms": 0.0,
+        "avg_frontend_message_build_ms": 0.0,
+        "total_frontend_token_estimate_ms": 0.0,
+        "avg_frontend_token_estimate_ms": 0.0,
+        "total_frontend_overhead_ms": 0.0,
+        "avg_frontend_overhead_ms": 0.0,
         "total_prompt_tokens": 0,
         "total_completion_tokens": 0,
         "total_tokens": 0,
@@ -1580,6 +1657,8 @@ def _empty_backend_latency_summary() -> Dict[str, object]:
         "total_ordered_segment_tokens": 0,
         "total_request_segment_tokens": 0,
         "total_assembled_prompt_tokens_estimate": 0,
+        "total_prompt_payload_tokens_estimate": 0,
+        "total_duplicate_prompt_tokens_estimate": 0,
         "step_rows": [],
     }
 
@@ -1926,6 +2005,10 @@ def _aggregate_backend_latencies(
                     "prompt_mode": key[1],
                     "request_count": 0,
                     "total_duration_ms": 0.0,
+                    "total_backend_roundtrip_ms": 0.0,
+                    "total_frontend_message_build_ms": 0.0,
+                    "total_frontend_token_estimate_ms": 0.0,
+                    "total_frontend_overhead_ms": 0.0,
                     "total_prompt_tokens": 0,
                     "total_completion_tokens": 0,
                     "total_tokens": 0,
@@ -1935,12 +2018,26 @@ def _aggregate_backend_latencies(
                     "ordered_segment_tokens": 0,
                     "request_segment_tokens": 0,
                     "assembled_prompt_tokens_estimate": 0,
+                    "prompt_payload_tokens_estimate": 0,
+                    "duplicate_prompt_tokens_estimate": 0,
                 },
             )
             bucket["request_count"] = int(bucket["request_count"]) + int(row["request_count"])
             bucket["total_duration_ms"] = float(bucket["total_duration_ms"]) + float(
                 row["total_duration_ms"]
             )
+            bucket["total_backend_roundtrip_ms"] = float(
+                bucket["total_backend_roundtrip_ms"]
+            ) + float(row.get("total_backend_roundtrip_ms", 0.0))
+            bucket["total_frontend_message_build_ms"] = float(
+                bucket["total_frontend_message_build_ms"]
+            ) + float(row.get("total_frontend_message_build_ms", 0.0))
+            bucket["total_frontend_token_estimate_ms"] = float(
+                bucket["total_frontend_token_estimate_ms"]
+            ) + float(row.get("total_frontend_token_estimate_ms", 0.0))
+            bucket["total_frontend_overhead_ms"] = float(
+                bucket["total_frontend_overhead_ms"]
+            ) + float(row.get("total_frontend_overhead_ms", 0.0))
             bucket["total_prompt_tokens"] = int(bucket["total_prompt_tokens"]) + int(
                 row["total_prompt_tokens"]
             )
@@ -1966,6 +2063,12 @@ def _aggregate_backend_latencies(
             bucket["assembled_prompt_tokens_estimate"] = int(
                 bucket["assembled_prompt_tokens_estimate"]
             ) + int(row.get("assembled_prompt_tokens_estimate", 0))
+            bucket["prompt_payload_tokens_estimate"] = int(
+                bucket["prompt_payload_tokens_estimate"]
+            ) + int(row.get("prompt_payload_tokens_estimate", 0))
+            bucket["duplicate_prompt_tokens_estimate"] = int(
+                bucket["duplicate_prompt_tokens_estimate"]
+            ) + int(row.get("duplicate_prompt_tokens_estimate", 0))
 
     step_rows = []
     for key in sorted(grouped):
@@ -1980,6 +2083,34 @@ def _aggregate_backend_latencies(
                 "request_count": request_count,
                 "total_duration_ms": total_duration_ms,
                 "avg_duration_ms": total_duration_ms / request_count if request_count else 0.0,
+                "total_backend_roundtrip_ms": float(bucket["total_backend_roundtrip_ms"]),
+                "avg_backend_roundtrip_ms": (
+                    float(bucket["total_backend_roundtrip_ms"]) / request_count
+                    if request_count
+                    else 0.0
+                ),
+                "total_frontend_message_build_ms": float(
+                    bucket["total_frontend_message_build_ms"]
+                ),
+                "avg_frontend_message_build_ms": (
+                    float(bucket["total_frontend_message_build_ms"]) / request_count
+                    if request_count
+                    else 0.0
+                ),
+                "total_frontend_token_estimate_ms": float(
+                    bucket["total_frontend_token_estimate_ms"]
+                ),
+                "avg_frontend_token_estimate_ms": (
+                    float(bucket["total_frontend_token_estimate_ms"]) / request_count
+                    if request_count
+                    else 0.0
+                ),
+                "total_frontend_overhead_ms": float(bucket["total_frontend_overhead_ms"]),
+                "avg_frontend_overhead_ms": (
+                    float(bucket["total_frontend_overhead_ms"]) / request_count
+                    if request_count
+                    else 0.0
+                ),
                 "total_prompt_tokens": total_prompt_tokens,
                 "total_completion_tokens": int(bucket["total_completion_tokens"]),
                 "total_tokens": int(bucket["total_tokens"]),
@@ -2002,11 +2133,33 @@ def _aggregate_backend_latencies(
                 "assembled_prompt_tokens_estimate": int(
                     bucket["assembled_prompt_tokens_estimate"]
                 ),
+                "prompt_payload_tokens_estimate": int(
+                    bucket["prompt_payload_tokens_estimate"]
+                ),
+                "duplicate_prompt_tokens_estimate": int(
+                    bucket["duplicate_prompt_tokens_estimate"]
+                ),
             }
         )
 
     request_count = sum(int(latency["request_count"]) for latency in backend_latencies)
     total_duration_ms = sum(float(latency["total_duration_ms"]) for latency in backend_latencies)
+    total_backend_roundtrip_ms = sum(
+        float(latency.get("total_backend_roundtrip_ms", 0.0))
+        for latency in backend_latencies
+    )
+    total_frontend_message_build_ms = sum(
+        float(latency.get("total_frontend_message_build_ms", 0.0))
+        for latency in backend_latencies
+    )
+    total_frontend_token_estimate_ms = sum(
+        float(latency.get("total_frontend_token_estimate_ms", 0.0))
+        for latency in backend_latencies
+    )
+    total_frontend_overhead_ms = sum(
+        float(latency.get("total_frontend_overhead_ms", 0.0))
+        for latency in backend_latencies
+    )
     total_prompt_tokens = sum(int(latency["total_prompt_tokens"]) for latency in backend_latencies)
     total_completion_tokens = sum(
         int(latency["total_completion_tokens"]) for latency in backend_latencies
@@ -2035,11 +2188,35 @@ def _aggregate_backend_latencies(
         int(latency.get("total_assembled_prompt_tokens_estimate", 0))
         for latency in backend_latencies
     )
+    total_prompt_payload_tokens_estimate = sum(
+        int(latency.get("total_prompt_payload_tokens_estimate", 0))
+        for latency in backend_latencies
+    )
+    total_duplicate_prompt_tokens_estimate = sum(
+        int(latency.get("total_duplicate_prompt_tokens_estimate", 0))
+        for latency in backend_latencies
+    )
 
     return {
         "request_count": request_count,
         "total_duration_ms": total_duration_ms,
         "avg_duration_ms": total_duration_ms / request_count if request_count else 0.0,
+        "total_backend_roundtrip_ms": total_backend_roundtrip_ms,
+        "avg_backend_roundtrip_ms": (
+            total_backend_roundtrip_ms / request_count if request_count else 0.0
+        ),
+        "total_frontend_message_build_ms": total_frontend_message_build_ms,
+        "avg_frontend_message_build_ms": (
+            total_frontend_message_build_ms / request_count if request_count else 0.0
+        ),
+        "total_frontend_token_estimate_ms": total_frontend_token_estimate_ms,
+        "avg_frontend_token_estimate_ms": (
+            total_frontend_token_estimate_ms / request_count if request_count else 0.0
+        ),
+        "total_frontend_overhead_ms": total_frontend_overhead_ms,
+        "avg_frontend_overhead_ms": (
+            total_frontend_overhead_ms / request_count if request_count else 0.0
+        ),
         "total_prompt_tokens": total_prompt_tokens,
         "total_completion_tokens": total_completion_tokens,
         "total_tokens": total_tokens,
@@ -2060,6 +2237,8 @@ def _aggregate_backend_latencies(
         "total_ordered_segment_tokens": total_ordered_segment_tokens,
         "total_request_segment_tokens": total_request_segment_tokens,
         "total_assembled_prompt_tokens_estimate": total_assembled_prompt_tokens_estimate,
+        "total_prompt_payload_tokens_estimate": total_prompt_payload_tokens_estimate,
+        "total_duplicate_prompt_tokens_estimate": total_duplicate_prompt_tokens_estimate,
         "step_rows": step_rows,
     }
 
