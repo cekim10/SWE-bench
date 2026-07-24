@@ -63,6 +63,7 @@ SEMANTIC_STATE, AGENTIC = load_trace_modules()
 class TraceAgenticRunnerTests(unittest.TestCase):
     class CapturingBackend(AGENTIC.StubModelBackend):
         def __init__(self) -> None:
+            super().__init__()
             self.calls = []
 
         def complete(self, **kwargs):
@@ -165,6 +166,26 @@ class TraceAgenticRunnerTests(unittest.TestCase):
             self.assertIn("reviewer", producers)
             self.assertIn("router/decision", logical_keys)
             self.assertIn("reviewer/notes", logical_keys)
+
+    def test_synthetic_stress_runner_emits_runtime_and_backend_logs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = self.CapturingBackend()
+            runner = AGENTIC.SyntheticStressTracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=3,
+                max_files=2,
+                prompt_runtime_mode="segment_aware",
+            )
+            result = runner.run_instance(AGENTIC.build_demo_instance())
+            self.assertEqual(result["status"], "COMPLETED")
+            self.assertEqual(result["agent_family"], "synthetic_stress")
+            self.assertTrue(result["trace_validation"]["is_valid"])
+            self.assertTrue(Path(result["runtime_event_path"]).exists())
+            self.assertTrue(Path(result["backend_call_path"]).exists())
+            self.assertGreater(result["backend_call_summary"]["request_count"], 0)
+            self.assertGreater(len(backend.calls), 0)
 
     @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
     def test_real_langgraph_runner_emits_router_and_reviewer_states(self):

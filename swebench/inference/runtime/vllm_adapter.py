@@ -4,7 +4,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Dict, Protocol
+from typing import Dict, Protocol, Tuple
 
 from swebench.inference.runtime.segment_materializer import SegmentedGenerationRequest
 
@@ -19,8 +19,11 @@ class VLLMBackendRequest:
     prompt_mode: str = "monolithic"
     segment_request: SegmentedGenerationRequest | None = None
     extra_body: Dict[str, object] = field(default_factory=dict)
+    messages_override: Tuple[Tuple[str, str], ...] | None = None
 
     def to_messages(self) -> list[dict[str, str]]:
+        if self.messages_override is not None:
+            return [{"role": role, "content": content} for role, content in self.messages_override]
         if self.prompt_mode == "segment_aware" and self.segment_request is not None:
             return self.segment_request.to_openai_messages(
                 fallback_system_prompt=self.system_prompt
@@ -46,6 +49,7 @@ class VLLMCompletionResult:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    frontend_cache_hit: bool = False
 
 
 class VLLMAdapter(Protocol):
@@ -117,6 +121,7 @@ class OpenAICompatibleVLLMAdapter:
                 prompt_tokens=getattr(usage, "prompt_tokens", None),
                 completion_tokens=getattr(usage, "completion_tokens", None),
                 total_tokens=getattr(usage, "total_tokens", None),
+                frontend_cache_hit=bool(request.messages_override),
             )
         response = client.chat.completions.create(**payload)
         duration_ms = (time.perf_counter() - started_at) * 1000.0
@@ -128,4 +133,5 @@ class OpenAICompatibleVLLMAdapter:
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
             total_tokens=getattr(usage, "total_tokens", None),
+            frontend_cache_hit=bool(request.messages_override),
         )

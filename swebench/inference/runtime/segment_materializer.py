@@ -264,6 +264,8 @@ class RuntimeRecord:
     released_at: float | None
     access_count: int
     last_lookup_status: LookupStatus | None = None
+    pending_reclaim_at: float | None = None
+    pending_reclaim_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -302,6 +304,7 @@ class ContextSegmentGroup:
     consumer: str
     ordered_segment_ids: tuple[str, ...]
     prompt_id: str | None = None
+    request_segment_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -330,10 +333,26 @@ class SegmentedGenerationRequest:
     """Segment-aware request passed from the runtime layer to a serving adapter."""
 
     ordered_segments: tuple[ContextSegment, ...]
+    request_segments: tuple[ContextSegment, ...] = ()
+    fallback_system_prompt: str | None = None
+    fallback_user_prompt: str | None = None
     enable_prefix_caching: bool = True
 
     def assembled_prompt(self, separator: str = "\n\n") -> str:
-        return separator.join(segment.text for segment in self.ordered_segments if segment.text)
+        system_prompt = self.fallback_system_prompt or ""
+        user_prompt = self.fallback_user_prompt or ""
+        extra_messages = self.to_openai_messages(separator=separator)
+        assembled = []
+        if extra_messages and extra_messages[0]["role"] == "system":
+            system_prompt = extra_messages[0]["content"]
+            extra_messages = extra_messages[1:]
+        if extra_messages:
+            user_prompt = extra_messages[-1]["content"]
+        if system_prompt:
+            assembled.append(system_prompt)
+        if user_prompt:
+            assembled.append(user_prompt)
+        return separator.join(assembled)
 
     def to_openai_messages(
         self,
@@ -343,7 +362,11 @@ class SegmentedGenerationRequest:
     ) -> list[dict[str, str]]:
         system_parts = []
         user_parts = []
-        for segment in self.ordered_segments:
+        base_system_prompt = fallback_system_prompt or self.fallback_system_prompt
+        base_user_prompt = self.fallback_user_prompt
+        if base_user_prompt:
+            user_parts.append(base_user_prompt)
+        for segment in self.request_segments or self.ordered_segments:
             if not segment.text:
                 continue
             if segment.role == SegmentRole.SYSTEM:
@@ -353,9 +376,14 @@ class SegmentedGenerationRequest:
 
         messages: list[dict[str, str]] = []
         if system_parts:
-            messages.append({"role": "system", "content": separator.join(system_parts)})
-        elif fallback_system_prompt:
-            messages.append({"role": "system", "content": fallback_system_prompt})
+            if base_system_prompt:
+                messages.append(
+                    {"role": "system", "content": separator.join([base_system_prompt, *system_parts])}
+                )
+            else:
+                messages.append({"role": "system", "content": separator.join(system_parts)})
+        elif base_system_prompt:
+            messages.append({"role": "system", "content": base_system_prompt})
         messages.append({"role": "user", "content": separator.join(user_parts)})
         return messages
 
@@ -460,6 +488,8 @@ class SegmentRuntime:
         *,
         serving_adapter: ServingEngineAdapter | None = None,
         clock: Callable[[], float] | None = None,
+        reclaim_grace_by_role: Mapping[SegmentRole | str, float] | None = None,
+        hbm_budget_bytes: int | None = None,
     ) -> None:
         self.serving_adapter = serving_adapter or SyntheticMaterializationAdapter()
         self._clock = clock or time.time
@@ -467,6 +497,11 @@ class SegmentRuntime:
         self._records: Dict[str, RuntimeRecord] = {}
         self._current_segment_id_by_logical_id: Dict[str, str] = {}
         self._events: list[RuntimeEvent] = []
+        self._hbm_budget_bytes = hbm_budget_bytes
+        self._reclaim_grace_by_role = {
+            _normalize_role(role): float(grace)
+            for role, grace in (reclaim_grace_by_role or {}).items()
+        }
 
     def _now(self) -> float:
         return float(self._clock())
@@ -639,6 +674,11 @@ class SegmentRuntime:
         original_status: LookupStatus,
         reason: str,
     ) -> KVAssociation:
+        self.reclaim_expired()
+        self._reclaim_for_pressure(
+            required_bytes=max(segment.size_bytes, 0),
+            exclude_state_ids={segment.segment_id},
+        )
         previous_record = RuntimeRecord(**record.__dict__)
         association = self.serving_adapter.materialize(segment, execution_context)
         association.execution_context_key = execution_context
@@ -658,6 +698,115 @@ class SegmentRuntime:
             reason=reason,
         )
         return association
+
+    def _segment_grace_seconds(self, segment: ContextSegment) -> float:
+        return float(self._reclaim_grace_by_role.get(_normalize_role(segment.role), 0.0))
+
+    def _schedule_or_reclaim(
+        self,
+        *,
+        segment: ContextSegment,
+        record: RuntimeRecord,
+        reason: str,
+    ) -> None:
+        grace_seconds = self._segment_grace_seconds(segment)
+        if grace_seconds <= 0:
+            self._mark_associations_evicted(segment=segment, record=record, reason=reason)
+            record.pending_reclaim_at = None
+            record.pending_reclaim_reason = None
+            return
+        record.pending_reclaim_at = self._now() + grace_seconds
+        record.pending_reclaim_reason = reason
+
+    def reclaim_expired(self) -> int:
+        reclaimed = 0
+        now = self._now()
+        for state_id, record in self._records.items():
+            if record.pending_reclaim_at is None or record.pending_reclaim_at > now:
+                continue
+            segment = self._segments[state_id]
+            self._mark_associations_evicted(
+                segment=segment,
+                record=record,
+                reason=record.pending_reclaim_reason or "deferred_reclamation",
+            )
+            record.pending_reclaim_at = None
+            record.pending_reclaim_reason = None
+            reclaimed += 1
+        return reclaimed
+
+    def _resident_hbm_bytes(self) -> int:
+        total = 0
+        for state_id, segment in self._segments.items():
+            record = self._records[state_id]
+            if record.residency_state != ResidencyState.RESIDENT:
+                continue
+            if any(
+                association.resident and association.tier == ResidencyTier.HBM
+                for association in record.associations.values()
+            ):
+                total += segment.size_bytes
+        return total
+
+    def _pressure_victims(self, *, exclude_state_ids: set[str]) -> list[str]:
+        role_priority = {
+            SegmentRole.SCRATCH: 0,
+            SegmentRole.EVIDENCE: 1,
+            SegmentRole.PLAN: 2,
+            SegmentRole.TASK: 3,
+            SegmentRole.SYSTEM: 4,
+        }
+        candidates = []
+        for state_id, segment in self._segments.items():
+            if state_id in exclude_state_ids:
+                continue
+            record = self._records[state_id]
+            if record.residency_state != ResidencyState.RESIDENT:
+                continue
+            if not any(
+                association.resident and association.tier == ResidencyTier.HBM
+                for association in record.associations.values()
+            ):
+                continue
+            semantic_rank = 0 if record.semantic_state != SemanticState.REGISTERED else 1
+            candidates.append(
+                (
+                    semantic_rank,
+                    role_priority.get(_normalize_role(segment.role), 5),
+                    record.last_accessed_at if record.last_accessed_at is not None else float("-inf"),
+                    -segment.size_bytes,
+                    state_id,
+                )
+            )
+        candidates.sort()
+        return [state_id for _, _, _, _, state_id in candidates]
+
+    def _reclaim_for_pressure(
+        self,
+        *,
+        required_bytes: int,
+        exclude_state_ids: set[str],
+    ) -> int:
+        if self._hbm_budget_bytes is None or required_bytes <= 0:
+            return 0
+        reclaimed_bytes = 0
+        self.reclaim_expired()
+        while self._resident_hbm_bytes() + required_bytes > self._hbm_budget_bytes:
+            victims = self._pressure_victims(exclude_state_ids=exclude_state_ids)
+            if not victims:
+                break
+            victim_id = victims[0]
+            record = self._records[victim_id]
+            segment = self._segments[victim_id]
+            reclaimed_bytes += segment.size_bytes
+            self._mark_associations_evicted(
+                segment=segment,
+                record=record,
+                reason="policy_eviction",
+            )
+            record.pending_reclaim_at = None
+            record.pending_reclaim_reason = None
+        return reclaimed_bytes
 
     def lookup(
         self,
@@ -790,7 +939,7 @@ class SegmentRuntime:
         old_previous = RuntimeRecord(**old_record.__dict__)
         old_record.semantic_state = SemanticState.SUPERSEDED
         self._current_segment_id_by_logical_id[old.logical_id] = new_segment.segment_id
-        self._mark_associations_evicted(
+        self._schedule_or_reclaim(
             segment=old,
             record=old_record,
             reason="supersede_reclamation",
@@ -824,7 +973,7 @@ class SegmentRuntime:
             return
         record.semantic_state = SemanticState.RELEASED
         record.released_at = self._now()
-        self._mark_associations_evicted(
+        self._schedule_or_reclaim(
             segment=resolved_segment,
             record=record,
             reason="release_reclamation",
@@ -914,6 +1063,7 @@ class SegmentRuntime:
         consumer: str,
         ordered_segment_ids: Sequence[str],
         prompt_id: str | None = None,
+        request_segment_ids: Sequence[str] | None = None,
     ) -> ContextSegmentGroup:
         return ContextSegmentGroup(
             group_id=group_id,
@@ -921,6 +1071,7 @@ class SegmentRuntime:
             consumer=consumer,
             ordered_segment_ids=tuple(ordered_segment_ids),
             prompt_id=prompt_id,
+            request_segment_ids=tuple(request_segment_ids or ordered_segment_ids),
         )
 
     def execution_context_for_group(
@@ -976,6 +1127,7 @@ class SegmentRuntime:
         tokenizer_id: str = "group-tokenizer",
         inference_config: Mapping[str, object] | None = None,
     ) -> RuntimePlacementDecision:
+        self.reclaim_expired()
         policy = policy or ReuseAwareRuntimePolicy()
         decision = policy.decide(runtime=self, group=group)
         self.apply_decision(decision)
@@ -996,9 +1148,20 @@ class SegmentRuntime:
                 )
         return decision
 
-    def build_vllm_request(self, group: ContextSegmentGroup) -> SegmentedGenerationRequest:
+    def build_vllm_request(
+        self,
+        group: ContextSegmentGroup,
+        *,
+        fallback_system_prompt: str | None = None,
+        fallback_user_prompt: str | None = None,
+    ) -> SegmentedGenerationRequest:
         return SegmentedGenerationRequest(
-            ordered_segments=tuple(self.get_segment(state_id) for state_id in group.ordered_segment_ids)
+            ordered_segments=tuple(self.get_segment(state_id) for state_id in group.ordered_segment_ids),
+            request_segments=tuple(
+                self.get_segment(state_id) for state_id in group.request_segment_ids
+            ),
+            fallback_system_prompt=fallback_system_prompt,
+            fallback_user_prompt=fallback_user_prompt,
         )
 
     def snapshot(self) -> RuntimeResidencySnapshot:

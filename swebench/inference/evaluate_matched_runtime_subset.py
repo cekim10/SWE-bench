@@ -211,6 +211,11 @@ def build_matched_report(
                 - right_latency["total_prompt_tokens"],
             }
         )
+        comparison["prompt_token_inflation"] = (
+            right_latency["total_prompt_tokens"] / left_latency["total_prompt_tokens"]
+            if left_latency["total_prompt_tokens"]
+            else 0.0
+        )
 
     return {
         "left_label": left_label,
@@ -357,6 +362,11 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
                 right_latency["duration_ms_per_1k_prompt_tokens"],
             ),
             ("Total prompt tokens", left_latency["total_prompt_tokens"], right_latency["total_prompt_tokens"]),
+            (
+                "Frontend cache hit rate",
+                left_latency["frontend_cache_hit_rate"],
+                right_latency["frontend_cache_hit_rate"],
+            ),
         ]
         lines.extend(
             [
@@ -375,6 +385,14 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
                 )
             else:
                 lines.append(f"| {metric} | {left_value} | {right_value} | {delta} |")
+        inflation = report["comparison"].get("prompt_token_inflation")
+        if inflation is not None:
+            lines.extend(
+                [
+                    "",
+                    f"- Prompt token inflation (right / left): {float(inflation):.4f}",
+                ]
+            )
 
     lines.extend(
         [

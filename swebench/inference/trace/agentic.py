@@ -232,20 +232,29 @@ class StubModelBackend:
         segment_request: SegmentedGenerationRequest | None = None,
         materializer_snapshot: RuntimeResidencySnapshot | None = None,
     ) -> str:
+        messages = (
+            segment_request.to_openai_messages(fallback_system_prompt=system_prompt)
+            if prompt_mode == "segment_aware" and segment_request is not None
+            else [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
+        prompt_tokens = sum(approx_token_count(message["content"]) for message in messages)
         if step_name == "planner":
-            return (
+            text = (
                 f"Plan v{iteration}:\n"
                 "1. Inspect `safe_ratio` and the failing test.\n"
                 "2. Add zero-divisor handling.\n"
                 "3. Re-run verification.\n"
             )
-        if step_name == "router":
-            return (
+        elif step_name == "router":
+            text = (
                 f"Route v{iteration}: plan_then_patch\n"
                 "Reason: retrieved evidence suggests a localized source fix plus lightweight verification.\n"
             )
-        if step_name == "coder":
-            return (
+        elif step_name == "coder":
+            text = (
                 "--- a/src/math_utils.py\n"
                 "+++ b/src/math_utils.py\n"
                 "@@ -1,2 +1,4 @@\n"
@@ -255,26 +264,52 @@ class StubModelBackend:
                 "+        return 0\n"
                 "+    return a / b\n"
             )
-        if step_name == "tester":
+        elif step_name == "tester":
             if iteration == 1:
-                return (
+                text = (
                     "FAIL\n"
                     "The patch handles zero divisors, but you should verify edge cases and restate the intended invariant."
                 )
-            return "PASS\nThe patch matches the stated requirement and the targeted test should pass."
-        if step_name == "reviewer":
+            else:
+                text = "PASS\nThe patch matches the stated requirement and the targeted test should pass."
+        elif step_name == "reviewer":
             if iteration == 1:
-                return (
+                text = (
                     "Review v1:\n"
                     "- Guarding the zero divisor looks correct.\n"
                     "- Verification should explicitly confirm the zero-divisor contract.\n"
                 )
-            return (
+            else:
+                text = (
                 "Review v2:\n"
                 "- Patch matches the stated invariant.\n"
                 "- No additional changes required before verification.\n"
+                )
+        else:
+            raise ValueError(f"unknown step_name {step_name!r}")
+
+        completion_tokens = approx_token_count(text)
+        self._call_records.append(
+            {
+                "step_name": step_name,
+                "prompt_mode": prompt_mode,
+                "duration_ms": 0.0,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "segment_group_id": prompt_group.group_id if prompt_group is not None else None,
+                "segment_count": (
+                    len(segment_request.ordered_segments) if segment_request is not None else 0
+                ),
+                "runtime_hbm_bytes": (
+                    materializer_snapshot.hbm_bytes
+                    if materializer_snapshot is not None
+                    else None
+                ),
+                "frontend_cache_hit": False,
+            }
         )
-        raise ValueError(f"unknown step_name {step_name!r}")
+        return text
 
     @property
     def runtime_model_id(self) -> str:
@@ -429,6 +464,7 @@ class VLLMServerChatBackend:
         self.model = model
         self.temperature = temperature
         self._call_records: List[Dict[str, object]] = []
+        self._message_cache: Dict[str, tuple[tuple[str, str], ...]] = {}
         self.adapter = OpenAICompatibleVLLMAdapter(
             base_url=base_url or os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1"),
             api_key=os.environ.get("VLLM_API_KEY", "EMPTY"),
@@ -471,6 +507,48 @@ class VLLMServerChatBackend:
                 ),
             },
         )
+        request_key = sha256(
+            json.dumps(
+                {
+                    "model": request.model,
+                    "system_prompt": request.system_prompt,
+                    "user_prompt": request.user_prompt,
+                    "prompt_mode": request.prompt_mode,
+                    "segment_group_id": (
+                        prompt_group.group_id if prompt_group is not None else None
+                    ),
+                    "segment_request": (
+                        [segment.segment_id for segment in segment_request.ordered_segments]
+                        if segment_request is not None
+                        else None
+                    ),
+                    "request_segment_ids": (
+                        [segment.segment_id for segment in segment_request.request_segments]
+                        if segment_request is not None
+                        else None
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        cached_messages = self._message_cache.get(request_key)
+        if cached_messages is None:
+            cached_messages = tuple(
+                (message["role"], message["content"]) for message in request.to_messages()
+            )
+            self._message_cache[request_key] = cached_messages
+        request = VLLMBackendRequest(
+            model=request.model,
+            system_prompt=request.system_prompt,
+            user_prompt=request.user_prompt,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            prompt_mode=request.prompt_mode,
+            segment_request=request.segment_request,
+            extra_body=request.extra_body,
+            messages_override=cached_messages,
+        )
         result = self.adapter.complete_with_details(request)
         self._call_records.append(
             {
@@ -492,6 +570,9 @@ class VLLMServerChatBackend:
                     if materializer_snapshot is not None
                     else None
                 ),
+                "frontend_cache_hit": result.frontend_cache_hit,
+                "assembled_message_count": len(cached_messages),
+                "request_key": request_key,
             }
         )
         return result.text
@@ -794,6 +875,13 @@ class TracedAgentRunner:
             )
         self.prompt_runtime_mode = prompt_runtime_mode
         self._reset_monolithic_prompt_runtime_state()
+        self._reclaim_grace_by_role = {
+            "scratch": 0.0,
+            "evidence": 5.0,
+            "plan": 5.0,
+            "system": 3600.0,
+            "task": 3600.0,
+        }
 
     def _reset_monolithic_prompt_runtime_state(self) -> None:
         self._monolithic_prompt_versions_by_consumer: Dict[str, int] = {}
@@ -854,6 +942,31 @@ class TracedAgentRunner:
         if state_id is None:
             return
         materializer.release_segment(state_id)
+
+    def _request_segment_ids_for_step(
+        self,
+        *,
+        step_name: str,
+        segments: Sequence[Mapping[str, object]],
+    ) -> List[str]:
+        request_segment_ids: List[str] = []
+        for segment in segments:
+            state_id = str(segment["state_id"])
+            role = str(segment.get("segment_role", "")).lower()
+            include = True
+            if role in {"system", "task"}:
+                include = False
+            elif step_name == "coder" and role in {"plan", "artifact"}:
+                include = False
+            elif step_name == "coder" and role == "evidence" and state_id.startswith("retrieval_"):
+                include = False
+            elif step_name == "reviewer" and role in {"plan", "artifact"}:
+                include = False
+            elif step_name == "tester" and role in {"plan", "artifact"}:
+                include = False
+            if include:
+                request_segment_ids.append(state_id)
+        return request_segment_ids
 
     def _prepare_monolithic_prompt(
         self,
@@ -984,6 +1097,7 @@ class TracedAgentRunner:
         system_prompt: str = "",
         user_prompt: str = "",
         segments: Sequence[Mapping[str, object]],
+        request_segment_ids: Sequence[str] | None = None,
         metadata: Mapping[str, object] | None = None,
     ) -> tuple[ContextSegmentGroup, SegmentedGenerationRequest, RuntimeResidencySnapshot]:
         group = materializer.build_group(
@@ -992,6 +1106,7 @@ class TracedAgentRunner:
             consumer=consumer,
             ordered_segment_ids=[str(segment["state_id"]) for segment in segments],
             prompt_id=prompt_id,
+            request_segment_ids=request_segment_ids,
         )
         materializer.prepare_group_read(
             group,
@@ -1015,9 +1130,18 @@ class TracedAgentRunner:
                 "runtime_tokenizer_id": self.backend.runtime_tokenizer_id,
                 "runtime_hbm_bytes": snapshot.hbm_bytes,
                 "runtime_cpu_bytes": snapshot.cpu_bytes,
+                "runtime_request_segment_count": len(group.request_segment_ids),
             },
         )
-        return group, materializer.build_vllm_request(group), snapshot
+        return (
+            group,
+            materializer.build_vllm_request(
+                group,
+                fallback_system_prompt=system_prompt,
+                fallback_user_prompt=user_prompt,
+            ),
+            snapshot,
+        )
 
     def _prepare_langgraph_prompt_runtime(
         self,
@@ -1049,6 +1173,10 @@ class TracedAgentRunner:
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 segments=segments,
+                request_segment_ids=self._request_segment_ids_for_step(
+                    step_name=step_name,
+                    segments=segments,
+                ),
                 metadata=metadata,
             )
             return "segment_aware", group, request, snapshot
@@ -1128,6 +1256,8 @@ class TracedAgentRunner:
                 "total_tokens": 0,
                 "avg_prompt_tokens": 0.0,
                 "duration_ms_per_1k_prompt_tokens": 0.0,
+                "frontend_cache_hits": 0,
+                "frontend_cache_hit_rate": 0.0,
                 "step_rows": [],
             }
 
@@ -1137,6 +1267,9 @@ class TracedAgentRunner:
             int(record.get("completion_tokens") or 0) for record in call_records
         )
         total_tokens = sum(int(record.get("total_tokens") or 0) for record in call_records)
+        frontend_cache_hits = sum(
+            1 for record in call_records if bool(record.get("frontend_cache_hit", False))
+        )
         grouped: Dict[tuple[str, str], List[Mapping[str, object]]] = {}
         for record in call_records:
             key = (
@@ -1151,6 +1284,9 @@ class TracedAgentRunner:
             step_prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in rows)
             step_completion_tokens = sum(
                 int(row.get("completion_tokens") or 0) for row in rows
+            )
+            step_frontend_cache_hits = sum(
+                1 for row in rows if bool(row.get("frontend_cache_hit", False))
             )
             step_rows.append(
                 {
@@ -1169,6 +1305,10 @@ class TracedAgentRunner:
                         if step_prompt_tokens
                         else 0.0
                     ),
+                    "frontend_cache_hits": step_frontend_cache_hits,
+                    "frontend_cache_hit_rate": (
+                        step_frontend_cache_hits / len(rows) if rows else 0.0
+                    ),
                 }
             )
 
@@ -1185,6 +1325,8 @@ class TracedAgentRunner:
                 if total_prompt_tokens
                 else 0.0
             ),
+            "frontend_cache_hits": frontend_cache_hits,
+            "frontend_cache_hit_rate": frontend_cache_hits / len(call_records),
             "step_rows": step_rows,
         }
 
@@ -1666,6 +1808,40 @@ class TracedAgentRunner:
         if len(lines) <= 1:
             return truncate_text(verdict_text, 400)
         return truncate_text("\n".join(lines[1:]), 400)
+
+    def _stress_planner_system_prompt(self) -> str:
+        return (
+            "You are a long-horizon planning agent. Refine the current repair strategy "
+            "using persistent evidence and the latest critique."
+        )
+
+    def _stress_planner_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Stress iteration: {iteration}\n"
+            f"Issue:\n{instance.problem_statement}\n\n"
+            "Revise the current plan while preserving stable context."
+        )
+
+    def _stress_critic_system_prompt(self) -> str:
+        return (
+            "You are a critic agent. Review the current plan and identify one concrete "
+            "risk or improvement before the next iteration."
+        )
+
+    def _stress_critic_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Stress iteration: {iteration}\n"
+            f"Issue:\n{instance.problem_statement}\n\n"
+            "Provide concise critique to drive the next plan revision."
+        )
 
 
 class LangGraphStyleTracedAgentRunner(TracedAgentRunner):
@@ -2156,6 +2332,350 @@ class LangGraphStyleTracedAgentRunner(TracedAgentRunner):
         )
 
 
+class SyntheticStressTracedAgentRunner(TracedAgentRunner):
+    def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
+        trace_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}.jsonl"
+        runtime_event_path = (
+            self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}_runtime.jsonl"
+        )
+        backend_call_path = (
+            self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}_backend_calls.jsonl"
+        )
+        selected_files = self._select_files(instance)
+        self._reset_monolithic_prompt_runtime_state()
+
+        with TraceLogger(
+            trace_path,
+            workflow_id=instance.instance_id,
+            tenant_id=self.tenant_id,
+        ) as trace:
+            materializer = SegmentRuntime(
+                reclaim_grace_by_role=self._reclaim_grace_by_role,
+            )
+            system_prompt = self._system_prompt_text()
+            system_state = trace.create_state(
+                state_id="system_v1",
+                logical_key="prompt/system",
+                state_type="agent_anchor",
+                size_bytes=size_bytes(system_prompt),
+                token_count=approx_token_count(system_prompt),
+                producer="runner",
+                materialization="HBM",
+                metadata=module_metadata(
+                    context_module="system",
+                    lifecycle_class="long",
+                    is_immutable=True,
+                    is_shared=True,
+                    is_ephemeral=False,
+                    update_cause="static",
+                    agent_family="synthetic_stress",
+                ),
+            )
+            self._register_runtime_segment(
+                materializer=materializer,
+                handle=system_state,
+                workflow_id=instance.instance_id,
+                module="system",
+                role="system",
+                text=system_prompt,
+                materialization="HBM",
+                is_shared=True,
+                is_immutable=True,
+                is_ephemeral=False,
+                metadata={"agent_family": "synthetic_stress"},
+            )
+            task_state = trace.create_state(
+                state_id="task_v1",
+                logical_key="prompt/task",
+                state_type="conversation_history",
+                size_bytes=size_bytes(instance.problem_statement),
+                token_count=approx_token_count(instance.problem_statement),
+                producer="runner",
+                materialization="HBM",
+                metadata=module_metadata(
+                    context_module="task",
+                    lifecycle_class="long",
+                    is_immutable=True,
+                    is_shared=True,
+                    is_ephemeral=False,
+                    update_cause="task_fixed",
+                    agent_family="synthetic_stress",
+                ),
+            )
+            self._register_runtime_segment(
+                materializer=materializer,
+                handle=task_state,
+                workflow_id=instance.instance_id,
+                module="task",
+                role="task",
+                text=instance.problem_statement,
+                materialization="HBM",
+                is_shared=True,
+                is_immutable=True,
+                is_ephemeral=False,
+                metadata={"agent_family": "synthetic_stress"},
+            )
+            evidence_states = self._create_text_states(
+                trace=trace,
+                state_type="retrieved_document",
+                producer="retriever",
+                logical_prefix="stress_retrieval",
+                files=selected_files,
+                materialization="CPU",
+                context_module="evidence",
+                lifecycle_class="long",
+                is_immutable=True,
+                is_shared=True,
+                is_ephemeral=False,
+                update_cause="retrieval_refresh",
+            )
+            for state, (_, contents) in zip(evidence_states, sorted(selected_files.items())):
+                self._register_runtime_segment(
+                    materializer=materializer,
+                    handle=state,
+                    workflow_id=instance.instance_id,
+                    module="evidence",
+                    role="evidence",
+                    text=contents,
+                    materialization="CPU",
+                    is_shared=True,
+                    is_immutable=True,
+                    is_ephemeral=False,
+                    metadata={"agent_family": "synthetic_stress"},
+                )
+
+            live_state_ids = {system_state.state_id, task_state.state_id}
+            live_state_ids.update(state.state_id for state in evidence_states)
+            current_plan_id: str | None = None
+            current_critique_id: str | None = None
+            final_plan_text = ""
+            final_critique_text = ""
+
+            for iteration in range(1, self.max_iterations + 1):
+                planner_segments = [
+                    self._segment(system_state.state_id, "system", role="system"),
+                    self._segment(task_state.state_id, "task", role="task"),
+                ]
+                planner_segments.extend(
+                    self._segment(state.state_id, "evidence", role="evidence")
+                    for state in evidence_states
+                )
+                if current_critique_id is not None:
+                    planner_segments.append(
+                        self._segment(
+                            current_critique_id,
+                            "scratchpad",
+                            role="scratchpad",
+                            update_cause="stress_feedback",
+                        )
+                    )
+                prompt_mode, prompt_group, segment_request, snapshot = self._prepare_langgraph_prompt_runtime(
+                    materializer=materializer,
+                    trace=trace,
+                    workflow_id=instance.instance_id,
+                    consumer="stress_planner",
+                    step_name="planner",
+                    prompt_id=f"stress-planner-{iteration}",
+                    system_prompt=self._stress_planner_system_prompt(),
+                    user_prompt=self._stress_planner_user_prompt(instance, iteration),
+                    segments=planner_segments,
+                    metadata={"hook": "stress.planner", "iteration": iteration},
+                )
+                plan_text = self.backend.complete(
+                    step_name="planner",
+                    system_prompt=self._stress_planner_system_prompt(),
+                    user_prompt=self._stress_planner_user_prompt(instance, iteration),
+                    iteration=iteration,
+                    instance=instance,
+                    prompt_mode=prompt_mode,
+                    prompt_group=prompt_group,
+                    segment_request=segment_request,
+                    materializer_snapshot=snapshot,
+                )
+                plan_state = trace.create_state(
+                    state_id=f"stress_plan_v{iteration}",
+                    logical_key="stress/planner/plan",
+                    state_type="plan",
+                    size_bytes=size_bytes(plan_text),
+                    token_count=approx_token_count(plan_text),
+                    producer="stress_planner",
+                    parent_state_ids=(
+                        [current_critique_id] if current_critique_id is not None else None
+                    ),
+                    materialization="HBM",
+                    metadata=module_metadata(
+                        context_module="plan",
+                        lifecycle_class="medium",
+                        is_immutable=False,
+                        is_shared=False,
+                        is_ephemeral=False,
+                        update_cause="stress_replan",
+                        iteration=iteration,
+                        agent_family="synthetic_stress",
+                    ),
+                )
+                self._register_runtime_segment(
+                    materializer=materializer,
+                    handle=plan_state,
+                    workflow_id=instance.instance_id,
+                    module="plan",
+                    role="plan",
+                    text=plan_text,
+                    materialization="HBM",
+                    is_shared=False,
+                    is_immutable=False,
+                    is_ephemeral=False,
+                    metadata={"agent_family": "synthetic_stress"},
+                )
+                live_state_ids.add(plan_state.state_id)
+                if current_plan_id is not None:
+                    trace.supersede_state(
+                        current_plan_id,
+                        plan_state.state_id,
+                        metadata={"iteration": iteration},
+                    )
+                    trace.release_state(
+                        current_plan_id,
+                        consumer="stress_planner",
+                        metadata={"reason": "stress_replan"},
+                    )
+                    self._release_runtime_segment(
+                        materializer=materializer,
+                        state_id=current_plan_id,
+                    )
+                    live_state_ids.discard(current_plan_id)
+                current_plan_id = plan_state.state_id
+                final_plan_text = plan_text
+
+                critic_segments = [
+                    self._segment(system_state.state_id, "system", role="system"),
+                    self._segment(task_state.state_id, "task", role="task"),
+                    self._segment(current_plan_id, "plan", role="plan"),
+                ]
+                critic_segments.extend(
+                    self._segment(state.state_id, "evidence", role="evidence")
+                    for state in evidence_states
+                )
+                prompt_mode, prompt_group, segment_request, snapshot = self._prepare_langgraph_prompt_runtime(
+                    materializer=materializer,
+                    trace=trace,
+                    workflow_id=instance.instance_id,
+                    consumer="stress_critic",
+                    step_name="reviewer",
+                    prompt_id=f"stress-critic-{iteration}",
+                    system_prompt=self._stress_critic_system_prompt(),
+                    user_prompt=self._stress_critic_user_prompt(instance, iteration),
+                    segments=critic_segments,
+                    metadata={"hook": "stress.critic", "iteration": iteration},
+                )
+                critique_text = self.backend.complete(
+                    step_name="reviewer",
+                    system_prompt=self._stress_critic_system_prompt(),
+                    user_prompt=self._stress_critic_user_prompt(instance, iteration),
+                    iteration=iteration,
+                    instance=instance,
+                    prompt_mode=prompt_mode,
+                    prompt_group=prompt_group,
+                    segment_request=segment_request,
+                    materializer_snapshot=snapshot,
+                )
+                critique_state = trace.create_state(
+                    state_id=f"stress_critique_v{iteration}",
+                    logical_key="stress/critic/notes",
+                    state_type="error_diagnostic",
+                    size_bytes=size_bytes(critique_text),
+                    token_count=approx_token_count(critique_text),
+                    producer="stress_critic",
+                    parent_state_ids=[current_plan_id],
+                    materialization="CPU",
+                    metadata=module_metadata(
+                        context_module="scratchpad",
+                        lifecycle_class="short",
+                        is_immutable=False,
+                        is_shared=False,
+                        is_ephemeral=True,
+                        update_cause="stress_critique",
+                        iteration=iteration,
+                        agent_family="synthetic_stress",
+                    ),
+                )
+                self._register_runtime_segment(
+                    materializer=materializer,
+                    handle=critique_state,
+                    workflow_id=instance.instance_id,
+                    module="scratchpad",
+                    role="scratchpad",
+                    text=critique_text,
+                    materialization="CPU",
+                    is_shared=False,
+                    is_immutable=False,
+                    is_ephemeral=True,
+                    metadata={"agent_family": "synthetic_stress"},
+                )
+                live_state_ids.add(critique_state.state_id)
+                if current_critique_id is not None:
+                    trace.supersede_state(
+                        current_critique_id,
+                        critique_state.state_id,
+                        metadata={"iteration": iteration},
+                    )
+                    trace.release_state(
+                        current_critique_id,
+                        consumer="stress_critic",
+                        metadata={"reason": "stress_refresh"},
+                    )
+                    self._release_runtime_segment(
+                        materializer=materializer,
+                        state_id=current_critique_id,
+                    )
+                    live_state_ids.discard(current_critique_id)
+                current_critique_id = critique_state.state_id
+                final_critique_text = critique_text
+
+            for state_id in sorted(live_state_ids):
+                trace.release_state(state_id, consumer="workflow", metadata={"reason": "workflow_end"})
+                self._release_runtime_segment(materializer=materializer, state_id=state_id)
+            if self.prompt_runtime_mode == "monolithic":
+                self._release_monolithic_prompt_runtime(materializer=materializer)
+
+        events = load_trace_events(trace_path)
+        validation = validate_trace_events(events)
+        runtime_summary = self._runtime_event_summary(materializer)
+        backend_call_records = self.backend.drain_call_records()
+        backend_call_summary = self._backend_call_summary(backend_call_records)
+        self._write_runtime_events(
+            materializer=materializer,
+            runtime_event_path=runtime_event_path,
+            workflow_id=instance.instance_id,
+            agent_family="synthetic_stress",
+        )
+        self._write_backend_call_records(
+            backend_call_path=backend_call_path,
+            workflow_id=instance.instance_id,
+            call_records=backend_call_records,
+        )
+        return {
+            "instance_id": instance.instance_id,
+            "status": "COMPLETED",
+            "provider": getattr(self.backend, "name", self.backend.__class__.__name__),
+            "agent_family": "synthetic_stress",
+            "prompt_runtime_mode": self.prompt_runtime_mode,
+            "plan": final_plan_text,
+            "patch": "",
+            "verification": final_critique_text,
+            "trace_path": str(trace_path),
+            "runtime_event_path": str(runtime_event_path),
+            "runtime_event_summary": runtime_summary,
+            "backend_call_path": str(backend_call_path),
+            "backend_call_summary": backend_call_summary,
+            "trace_validation": {
+                "is_valid": validation.is_valid,
+                "errors": validation.errors,
+                "summary": validation.summary,
+            },
+        }
+
+
 class LangGraphTracedAgentRunner(TracedAgentRunner):
     def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
         StateGraph, START, END = _load_langgraph_symbols()
@@ -2171,7 +2691,9 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             workflow_id=instance.instance_id,
             tenant_id=self.tenant_id,
         ) as trace:
-            materializer = SegmentRuntime()
+            materializer = SegmentRuntime(
+                reclaim_grace_by_role=self._reclaim_grace_by_role,
+            )
             system_prompt = self._system_prompt_text()
             system_state = trace.create_state(
                 state_id="system_v1",

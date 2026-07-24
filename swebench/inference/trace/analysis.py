@@ -729,6 +729,9 @@ def analyze_backend_call_records(
         int(record.get("completion_tokens") or 0) for record in records
     )
     total_tokens = sum(int(record.get("total_tokens") or 0) for record in records)
+    frontend_cache_hits = sum(
+        1 for record in records if bool(record.get("frontend_cache_hit", False))
+    )
     grouped: Dict[tuple[str, str], List[Mapping[str, object]]] = defaultdict(list)
     for record in records:
         grouped[
@@ -752,6 +755,9 @@ def analyze_backend_call_records(
         step_total_tokens = sum(
             int(record.get("total_tokens") or 0) for record in step_records
         )
+        step_frontend_cache_hits = sum(
+            1 for record in step_records if bool(record.get("frontend_cache_hit", False))
+        )
         step_rows.append(
             {
                 "step_name": step_name,
@@ -770,6 +776,10 @@ def analyze_backend_call_records(
                     if step_prompt_tokens
                     else 0.0
                 ),
+                "frontend_cache_hits": step_frontend_cache_hits,
+                "frontend_cache_hit_rate": (
+                    step_frontend_cache_hits / len(step_records) if step_records else 0.0
+                ),
             }
         )
 
@@ -786,6 +796,8 @@ def analyze_backend_call_records(
             if total_prompt_tokens
             else 0.0
         ),
+        "frontend_cache_hits": frontend_cache_hits,
+        "frontend_cache_hit_rate": frontend_cache_hits / len(records),
         "step_rows": step_rows,
     }
 
@@ -1072,18 +1084,20 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Total completion tokens: {backend_latency['total_completion_tokens']}",
                 f"- Avg prompt tokens / request: {backend_latency['avg_prompt_tokens']:.2f}",
                 f"- Duration ms per 1k prompt tokens: {backend_latency['duration_ms_per_1k_prompt_tokens']:.2f}",
+                f"- Frontend cache hit rate: {backend_latency['frontend_cache_hit_rate']:.2f}",
                 "",
                 "### By Step",
                 "",
-                "| Step | Prompt Mode | Requests | Avg Duration ms | Total Prompt Tokens | Avg Prompt Tokens | ms / 1k Prompt Tokens |",
-                "| - | - | -: | -: | -: | -: | -: |",
+                "| Step | Prompt Mode | Requests | Avg Duration ms | Total Prompt Tokens | Avg Prompt Tokens | ms / 1k Prompt Tokens | Frontend Cache Hit Rate |",
+                "| - | - | -: | -: | -: | -: | -: | -: |",
             ]
         )
         for row in backend_latency["step_rows"]:
             lines.append(
                 f"| {row['step_name']} | {row['prompt_mode']} | {row['request_count']} | "
                 f"{row['avg_duration_ms']:.2f} | {row['total_prompt_tokens']} | "
-                f"{row['avg_prompt_tokens']:.2f} | {row['duration_ms_per_1k_prompt_tokens']:.2f} |"
+                f"{row['avg_prompt_tokens']:.2f} | {row['duration_ms_per_1k_prompt_tokens']:.2f} | "
+                f"{row['frontend_cache_hit_rate']:.2f} |"
             )
 
     if "providers" in report:
@@ -1513,6 +1527,8 @@ def _empty_backend_latency_summary() -> Dict[str, object]:
         "total_tokens": 0,
         "avg_prompt_tokens": 0.0,
         "duration_ms_per_1k_prompt_tokens": 0.0,
+        "frontend_cache_hits": 0,
+        "frontend_cache_hit_rate": 0.0,
         "step_rows": [],
     }
 
@@ -1862,6 +1878,7 @@ def _aggregate_backend_latencies(
                     "total_prompt_tokens": 0,
                     "total_completion_tokens": 0,
                     "total_tokens": 0,
+                    "frontend_cache_hits": 0,
                 },
             )
             bucket["request_count"] = int(bucket["request_count"]) + int(row["request_count"])
@@ -1875,6 +1892,9 @@ def _aggregate_backend_latencies(
                 bucket["total_completion_tokens"]
             ) + int(row["total_completion_tokens"])
             bucket["total_tokens"] = int(bucket["total_tokens"]) + int(row["total_tokens"])
+            bucket["frontend_cache_hits"] = int(bucket["frontend_cache_hits"]) + int(
+                row.get("frontend_cache_hits", 0)
+            )
 
     step_rows = []
     for key in sorted(grouped):
@@ -1900,6 +1920,10 @@ def _aggregate_backend_latencies(
                     if total_prompt_tokens
                     else 0.0
                 ),
+                "frontend_cache_hits": int(bucket["frontend_cache_hits"]),
+                "frontend_cache_hit_rate": (
+                    int(bucket["frontend_cache_hits"]) / request_count if request_count else 0.0
+                ),
             }
         )
 
@@ -1910,6 +1934,9 @@ def _aggregate_backend_latencies(
         int(latency["total_completion_tokens"]) for latency in backend_latencies
     )
     total_tokens = sum(int(latency["total_tokens"]) for latency in backend_latencies)
+    frontend_cache_hits = sum(
+        int(latency.get("frontend_cache_hits", 0)) for latency in backend_latencies
+    )
 
     return {
         "request_count": request_count,
@@ -1925,6 +1952,10 @@ def _aggregate_backend_latencies(
             total_duration_ms / (total_prompt_tokens / 1000.0)
             if total_prompt_tokens
             else 0.0
+        ),
+        "frontend_cache_hits": frontend_cache_hits,
+        "frontend_cache_hit_rate": (
+            frontend_cache_hits / request_count if request_count else 0.0
         ),
         "step_rows": step_rows,
     }
