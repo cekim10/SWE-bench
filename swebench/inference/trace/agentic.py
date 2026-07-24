@@ -240,6 +240,12 @@ class StubModelBackend:
                 {"role": "user", "content": user_prompt},
             ]
         )
+        assembled_prompt_tokens_estimate = sum(
+            approx_token_count(message["content"]) for message in messages
+        )
+        request_segment_tokens = sum(
+            segment.token_count for segment in (segment_request.request_segments if segment_request is not None else ())
+        )
         prompt_tokens = sum(approx_token_count(message["content"]) for message in messages)
         if step_name == "planner":
             text = (
@@ -301,6 +307,21 @@ class StubModelBackend:
                 "segment_count": (
                     len(segment_request.ordered_segments) if segment_request is not None else 0
                 ),
+                "ordered_segment_count": (
+                    len(segment_request.ordered_segments) if segment_request is not None else 0
+                ),
+                "request_segment_count": (
+                    len(segment_request.request_segments) if segment_request is not None else 0
+                ),
+                "system_prompt_tokens_estimate": approx_token_count(system_prompt),
+                "user_prompt_tokens_estimate": approx_token_count(user_prompt),
+                "ordered_segment_tokens": (
+                    sum(segment.token_count for segment in segment_request.ordered_segments)
+                    if segment_request is not None
+                    else 0
+                ),
+                "request_segment_tokens": request_segment_tokens,
+                "assembled_prompt_tokens_estimate": assembled_prompt_tokens_estimate,
                 "runtime_hbm_bytes": (
                     materializer_snapshot.hbm_bytes
                     if materializer_snapshot is not None
@@ -550,6 +571,14 @@ class VLLMServerChatBackend:
             messages_override=cached_messages,
         )
         result = self.adapter.complete_with_details(request)
+        assembled_prompt_tokens_estimate = sum(
+            approx_token_count(content) for _, content in cached_messages
+        )
+        request_segment_tokens = (
+            sum(segment.token_count for segment in segment_request.request_segments)
+            if segment_request is not None
+            else 0
+        )
         self._call_records.append(
             {
                 "step_name": step_name,
@@ -565,6 +594,25 @@ class VLLMServerChatBackend:
                     if segment_request is not None
                     else 0
                 ),
+                "ordered_segment_count": (
+                    len(segment_request.ordered_segments)
+                    if segment_request is not None
+                    else 0
+                ),
+                "request_segment_count": (
+                    len(segment_request.request_segments)
+                    if segment_request is not None
+                    else 0
+                ),
+                "system_prompt_tokens_estimate": approx_token_count(system_prompt),
+                "user_prompt_tokens_estimate": approx_token_count(user_prompt),
+                "ordered_segment_tokens": (
+                    sum(segment.token_count for segment in segment_request.ordered_segments)
+                    if segment_request is not None
+                    else 0
+                ),
+                "request_segment_tokens": request_segment_tokens,
+                "assembled_prompt_tokens_estimate": assembled_prompt_tokens_estimate,
                 "runtime_hbm_bytes": (
                     materializer_snapshot.hbm_bytes
                     if materializer_snapshot is not None
@@ -1258,6 +1306,11 @@ class TracedAgentRunner:
                 "duration_ms_per_1k_prompt_tokens": 0.0,
                 "frontend_cache_hits": 0,
                 "frontend_cache_hit_rate": 0.0,
+                "total_system_prompt_tokens_estimate": 0,
+                "total_user_prompt_tokens_estimate": 0,
+                "total_ordered_segment_tokens": 0,
+                "total_request_segment_tokens": 0,
+                "total_assembled_prompt_tokens_estimate": 0,
                 "step_rows": [],
             }
 
@@ -1269,6 +1322,21 @@ class TracedAgentRunner:
         total_tokens = sum(int(record.get("total_tokens") or 0) for record in call_records)
         frontend_cache_hits = sum(
             1 for record in call_records if bool(record.get("frontend_cache_hit", False))
+        )
+        total_system_prompt_tokens_estimate = sum(
+            int(record.get("system_prompt_tokens_estimate") or 0) for record in call_records
+        )
+        total_user_prompt_tokens_estimate = sum(
+            int(record.get("user_prompt_tokens_estimate") or 0) for record in call_records
+        )
+        total_ordered_segment_tokens = sum(
+            int(record.get("ordered_segment_tokens") or 0) for record in call_records
+        )
+        total_request_segment_tokens = sum(
+            int(record.get("request_segment_tokens") or 0) for record in call_records
+        )
+        total_assembled_prompt_tokens_estimate = sum(
+            int(record.get("assembled_prompt_tokens_estimate") or 0) for record in call_records
         )
         grouped: Dict[tuple[str, str], List[Mapping[str, object]]] = {}
         for record in call_records:
@@ -1287,6 +1355,21 @@ class TracedAgentRunner:
             )
             step_frontend_cache_hits = sum(
                 1 for row in rows if bool(row.get("frontend_cache_hit", False))
+            )
+            step_system_prompt_tokens_estimate = sum(
+                int(row.get("system_prompt_tokens_estimate") or 0) for row in rows
+            )
+            step_user_prompt_tokens_estimate = sum(
+                int(row.get("user_prompt_tokens_estimate") or 0) for row in rows
+            )
+            step_ordered_segment_tokens = sum(
+                int(row.get("ordered_segment_tokens") or 0) for row in rows
+            )
+            step_request_segment_tokens = sum(
+                int(row.get("request_segment_tokens") or 0) for row in rows
+            )
+            step_assembled_prompt_tokens_estimate = sum(
+                int(row.get("assembled_prompt_tokens_estimate") or 0) for row in rows
             )
             step_rows.append(
                 {
@@ -1309,6 +1392,11 @@ class TracedAgentRunner:
                     "frontend_cache_hit_rate": (
                         step_frontend_cache_hits / len(rows) if rows else 0.0
                     ),
+                    "system_prompt_tokens_estimate": step_system_prompt_tokens_estimate,
+                    "user_prompt_tokens_estimate": step_user_prompt_tokens_estimate,
+                    "ordered_segment_tokens": step_ordered_segment_tokens,
+                    "request_segment_tokens": step_request_segment_tokens,
+                    "assembled_prompt_tokens_estimate": step_assembled_prompt_tokens_estimate,
                 }
             )
 
@@ -1327,6 +1415,11 @@ class TracedAgentRunner:
             ),
             "frontend_cache_hits": frontend_cache_hits,
             "frontend_cache_hit_rate": frontend_cache_hits / len(call_records),
+            "total_system_prompt_tokens_estimate": total_system_prompt_tokens_estimate,
+            "total_user_prompt_tokens_estimate": total_user_prompt_tokens_estimate,
+            "total_ordered_segment_tokens": total_ordered_segment_tokens,
+            "total_request_segment_tokens": total_request_segment_tokens,
+            "total_assembled_prompt_tokens_estimate": total_assembled_prompt_tokens_estimate,
             "step_rows": step_rows,
         }
 
@@ -1775,6 +1868,17 @@ class TracedAgentRunner:
             f"Repository context:\n{make_code_text(selected_files)}\n"
         )
 
+    def _coder_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Iteration: {iteration}\n"
+            f"Issue:\n{instance.problem_statement}\n\n"
+            "Use the current routed context, active plan, and repository evidence to produce a minimal unified diff patch.\n"
+        )
+
     def _tester_system_prompt(self) -> str:
         return (
             "You are a verification agent. Decide if the patch resolves the issue. "
@@ -1793,6 +1897,17 @@ class TracedAgentRunner:
             f"Issue:\n{instance.problem_statement}\n\n"
             f"Plan:\n{plan_text}\n\n"
             f"Patch:\n{patch_text}\n"
+        )
+
+    def _tester_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Iteration: {iteration}\n"
+            f"Issue:\n{instance.problem_statement}\n\n"
+            "Evaluate the current patch against the active plan and return PASS or FAIL.\n"
         )
 
     def _classify_verdict(self, verdict_text: str) -> str:
@@ -2311,6 +2426,26 @@ class LangGraphStyleTracedAgentRunner(TracedAgentRunner):
             + "\n".join(f"- {path}" for path in sorted(selected_files))
         )
 
+    def _router_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        iteration: int,
+        diagnostic_state_id: str | None,
+    ) -> str:
+        diagnostic_text = (
+            "Previous failure context is available as runtime scratch context.\n"
+            if diagnostic_state_id is not None
+            else ""
+        )
+        return (
+            f"Iteration: {iteration}\n"
+            f"Issue:\n{instance.problem_statement}\n\n"
+            f"{diagnostic_text}"
+            f"Candidate files:\n"
+            + "\n".join(f"- {path}" for path in sorted(selected_files))
+        )
+
     def _reviewer_system_prompt(self) -> str:
         return (
             "You are a review agent. Inspect the proposed patch, identify residual risks, "
@@ -2329,6 +2464,17 @@ class LangGraphStyleTracedAgentRunner(TracedAgentRunner):
             f"Issue:\n{instance.problem_statement}\n\n"
             f"Plan:\n{plan_text}\n\n"
             f"Patch under review:\n{patch_text}\n"
+        )
+
+    def _reviewer_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Iteration: {iteration}\n"
+            f"Issue:\n{instance.problem_statement}\n\n"
+            "Review the active patch against the active plan and summarize residual risk.\n"
         )
 
 
@@ -2824,6 +2970,21 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             def router_node(state: LangGraphRunnerState) -> LangGraphRunnerState:
                 iteration = int(state["iteration"])
                 diagnostic_state_id = state.get("diagnostic_state_id")
+                router_user_prompt = (
+                    self._router_instruction_prompt(
+                        instance,
+                        selected_files,
+                        iteration,
+                        diagnostic_state_id,
+                    )
+                    if self.prompt_runtime_mode == "segment_aware"
+                    else self._router_user_prompt(
+                        instance,
+                        selected_files,
+                        iteration,
+                        diagnostic_state_id,
+                    )
+                )
                 router_segments = [
                     self._segment(system_state.state_id, "system", role="system"),
                     self._segment(task_state.state_id, "task", role="task"),
@@ -2853,24 +3014,14 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     step_name="router",
                     prompt_id=f"router-{iteration}",
                     system_prompt=self._router_system_prompt(),
-                    user_prompt=self._router_user_prompt(
-                        instance,
-                        selected_files,
-                        iteration,
-                        diagnostic_state_id,
-                    ),
+                    user_prompt=router_user_prompt,
                     segments=router_segments,
                     metadata={"hook": "router.messages_for_llm", "iteration": iteration},
                 )
                 route_text = self.backend.complete(
                     step_name="router",
                     system_prompt=self._router_system_prompt(),
-                    user_prompt=self._router_user_prompt(
-                        instance,
-                        selected_files,
-                        iteration,
-                        diagnostic_state_id,
-                    ),
+                    user_prompt=router_user_prompt,
                     iteration=iteration,
                     instance=instance,
                     prompt_mode=prompt_mode,
@@ -2922,6 +3073,12 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             def planner_node(state: LangGraphRunnerState) -> LangGraphRunnerState:
                 iteration = int(state["iteration"])
                 diagnostic_state_id = state.get("diagnostic_state_id")
+                planner_user_prompt = self._planner_user_prompt(
+                    instance,
+                    selected_files,
+                    iteration,
+                    diagnostic_state_id,
+                )
                 planner_segments = [
                     self._segment(system_state.state_id, "system", role="system"),
                     self._segment(task_state.state_id, "task", role="task"),
@@ -2952,19 +3109,14 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     step_name="planner",
                     prompt_id=f"planner-{iteration}",
                     system_prompt=self._planner_system_prompt(),
-                    user_prompt=self._planner_user_prompt(
-                        instance,
-                        selected_files,
-                        iteration,
-                        diagnostic_state_id,
-                    ),
+                    user_prompt=planner_user_prompt,
                     segments=planner_segments,
                     metadata={"hook": "planner.messages_for_llm", "iteration": iteration},
                 )
                 plan_text = self.backend.complete(
                     step_name="planner",
                     system_prompt=self._planner_system_prompt(),
-                    user_prompt=self._planner_user_prompt(instance, selected_files, iteration, diagnostic_state_id),
+                    user_prompt=planner_user_prompt,
                     iteration=iteration,
                     instance=instance,
                     prompt_mode=prompt_mode,
@@ -3023,6 +3175,11 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             def coder_node(state: LangGraphRunnerState) -> LangGraphRunnerState:
                 iteration = int(state["iteration"])
                 plan_text = str(state["final_plan_text"])
+                coder_user_prompt = (
+                    self._coder_instruction_prompt(instance, iteration)
+                    if self.prompt_runtime_mode == "segment_aware"
+                    else self._coder_user_prompt(instance, selected_files, plan_text, iteration)
+                )
                 coder_segments = [
                     self._segment(system_state.state_id, "system", role="system"),
                     self._segment(task_state.state_id, "task", role="task"),
@@ -3045,19 +3202,14 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     step_name="coder",
                     prompt_id=f"coder-{iteration}",
                     system_prompt=self._coder_system_prompt(),
-                    user_prompt=self._coder_user_prompt(
-                        instance,
-                        selected_files,
-                        plan_text,
-                        iteration,
-                    ),
+                    user_prompt=coder_user_prompt,
                     segments=coder_segments,
                     metadata={"hook": "coder.messages_for_llm", "iteration": iteration},
                 )
                 patch_text = self.backend.complete(
                     step_name="coder",
                     system_prompt=self._coder_system_prompt(),
-                    user_prompt=self._coder_user_prompt(instance, selected_files, plan_text, iteration),
+                    user_prompt=coder_user_prompt,
                     iteration=iteration,
                     instance=instance,
                     prompt_mode=prompt_mode,
@@ -3116,6 +3268,11 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                 iteration = int(state["iteration"])
                 plan_text = str(state["final_plan_text"])
                 patch_text = str(state["final_patch_text"])
+                reviewer_user_prompt = (
+                    self._reviewer_instruction_prompt(instance, iteration)
+                    if self.prompt_runtime_mode == "segment_aware"
+                    else self._reviewer_user_prompt(instance, plan_text, patch_text, iteration)
+                )
                 reviewer_segments = [
                     self._segment(system_state.state_id, "system", role="system"),
                     self._segment(task_state.state_id, "task", role="task"),
@@ -3131,19 +3288,14 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     step_name="reviewer",
                     prompt_id=f"reviewer-{iteration}",
                     system_prompt=self._reviewer_system_prompt(),
-                    user_prompt=self._reviewer_user_prompt(
-                        instance,
-                        plan_text,
-                        patch_text,
-                        iteration,
-                    ),
+                    user_prompt=reviewer_user_prompt,
                     segments=reviewer_segments,
                     metadata={"hook": "reviewer.messages_for_llm", "iteration": iteration},
                 )
                 review_text = self.backend.complete(
                     step_name="reviewer",
                     system_prompt=self._reviewer_system_prompt(),
-                    user_prompt=self._reviewer_user_prompt(instance, plan_text, patch_text, iteration),
+                    user_prompt=reviewer_user_prompt,
                     iteration=iteration,
                     instance=instance,
                     prompt_mode=prompt_mode,
@@ -3197,6 +3349,11 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                 iteration = int(state["iteration"])
                 plan_text = str(state["final_plan_text"])
                 patch_text = str(state["final_patch_text"])
+                tester_user_prompt = (
+                    self._tester_instruction_prompt(instance, iteration)
+                    if self.prompt_runtime_mode == "segment_aware"
+                    else self._tester_user_prompt(instance, plan_text, patch_text, iteration)
+                )
                 tester_segments = [
                     self._segment(system_state.state_id, "system", role="system"),
                     self._segment(task_state.state_id, "task", role="task"),
@@ -3211,19 +3368,14 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     step_name="tester",
                     prompt_id=f"tester-{iteration}",
                     system_prompt=self._tester_system_prompt(),
-                    user_prompt=self._tester_user_prompt(
-                        instance,
-                        plan_text,
-                        patch_text,
-                        iteration,
-                    ),
+                    user_prompt=tester_user_prompt,
                     segments=tester_segments,
                     metadata={"hook": "tester.messages_for_llm", "iteration": iteration},
                 )
                 verdict_text = self.backend.complete(
                     step_name="tester",
                     system_prompt=self._tester_system_prompt(),
-                    user_prompt=self._tester_user_prompt(instance, plan_text, patch_text, iteration),
+                    user_prompt=tester_user_prompt,
                     iteration=iteration,
                     instance=instance,
                     prompt_mode=prompt_mode,

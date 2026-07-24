@@ -732,6 +732,21 @@ def analyze_backend_call_records(
     frontend_cache_hits = sum(
         1 for record in records if bool(record.get("frontend_cache_hit", False))
     )
+    total_system_prompt_tokens_estimate = sum(
+        int(record.get("system_prompt_tokens_estimate") or 0) for record in records
+    )
+    total_user_prompt_tokens_estimate = sum(
+        int(record.get("user_prompt_tokens_estimate") or 0) for record in records
+    )
+    total_ordered_segment_tokens = sum(
+        int(record.get("ordered_segment_tokens") or 0) for record in records
+    )
+    total_request_segment_tokens = sum(
+        int(record.get("request_segment_tokens") or 0) for record in records
+    )
+    total_assembled_prompt_tokens_estimate = sum(
+        int(record.get("assembled_prompt_tokens_estimate") or 0) for record in records
+    )
     grouped: Dict[tuple[str, str], List[Mapping[str, object]]] = defaultdict(list)
     for record in records:
         grouped[
@@ -758,6 +773,21 @@ def analyze_backend_call_records(
         step_frontend_cache_hits = sum(
             1 for record in step_records if bool(record.get("frontend_cache_hit", False))
         )
+        step_system_prompt_tokens_estimate = sum(
+            int(record.get("system_prompt_tokens_estimate") or 0) for record in step_records
+        )
+        step_user_prompt_tokens_estimate = sum(
+            int(record.get("user_prompt_tokens_estimate") or 0) for record in step_records
+        )
+        step_ordered_segment_tokens = sum(
+            int(record.get("ordered_segment_tokens") or 0) for record in step_records
+        )
+        step_request_segment_tokens = sum(
+            int(record.get("request_segment_tokens") or 0) for record in step_records
+        )
+        step_assembled_prompt_tokens_estimate = sum(
+            int(record.get("assembled_prompt_tokens_estimate") or 0) for record in step_records
+        )
         step_rows.append(
             {
                 "step_name": step_name,
@@ -780,6 +810,11 @@ def analyze_backend_call_records(
                 "frontend_cache_hit_rate": (
                     step_frontend_cache_hits / len(step_records) if step_records else 0.0
                 ),
+                "system_prompt_tokens_estimate": step_system_prompt_tokens_estimate,
+                "user_prompt_tokens_estimate": step_user_prompt_tokens_estimate,
+                "ordered_segment_tokens": step_ordered_segment_tokens,
+                "request_segment_tokens": step_request_segment_tokens,
+                "assembled_prompt_tokens_estimate": step_assembled_prompt_tokens_estimate,
             }
         )
 
@@ -798,6 +833,11 @@ def analyze_backend_call_records(
         ),
         "frontend_cache_hits": frontend_cache_hits,
         "frontend_cache_hit_rate": frontend_cache_hits / len(records),
+        "total_system_prompt_tokens_estimate": total_system_prompt_tokens_estimate,
+        "total_user_prompt_tokens_estimate": total_user_prompt_tokens_estimate,
+        "total_ordered_segment_tokens": total_ordered_segment_tokens,
+        "total_request_segment_tokens": total_request_segment_tokens,
+        "total_assembled_prompt_tokens_estimate": total_assembled_prompt_tokens_estimate,
         "step_rows": step_rows,
     }
 
@@ -1085,18 +1125,24 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Avg prompt tokens / request: {backend_latency['avg_prompt_tokens']:.2f}",
                 f"- Duration ms per 1k prompt tokens: {backend_latency['duration_ms_per_1k_prompt_tokens']:.2f}",
                 f"- Frontend cache hit rate: {backend_latency['frontend_cache_hit_rate']:.2f}",
+                f"- System prompt tokens (est.): {backend_latency['total_system_prompt_tokens_estimate']}",
+                f"- User instruction tokens (est.): {backend_latency['total_user_prompt_tokens_estimate']}",
+                f"- Ordered segment tokens: {backend_latency['total_ordered_segment_tokens']}",
+                f"- Request segment tokens: {backend_latency['total_request_segment_tokens']}",
+                f"- Assembled prompt tokens (est.): {backend_latency['total_assembled_prompt_tokens_estimate']}",
                 "",
                 "### By Step",
                 "",
-                "| Step | Prompt Mode | Requests | Avg Duration ms | Total Prompt Tokens | Avg Prompt Tokens | ms / 1k Prompt Tokens | Frontend Cache Hit Rate |",
-                "| - | - | -: | -: | -: | -: | -: | -: |",
+                "| Step | Prompt Mode | Requests | Avg Duration ms | Total Prompt Tokens | User Tokens | Request Segment Tokens | Assembled Tokens (est.) | ms / 1k Prompt Tokens | Frontend Cache Hit Rate |",
+                "| - | - | -: | -: | -: | -: | -: | -: | -: | -: |",
             ]
         )
         for row in backend_latency["step_rows"]:
             lines.append(
                 f"| {row['step_name']} | {row['prompt_mode']} | {row['request_count']} | "
                 f"{row['avg_duration_ms']:.2f} | {row['total_prompt_tokens']} | "
-                f"{row['avg_prompt_tokens']:.2f} | {row['duration_ms_per_1k_prompt_tokens']:.2f} | "
+                f"{row['user_prompt_tokens_estimate']} | {row['request_segment_tokens']} | "
+                f"{row['assembled_prompt_tokens_estimate']} | {row['duration_ms_per_1k_prompt_tokens']:.2f} | "
                 f"{row['frontend_cache_hit_rate']:.2f} |"
             )
 
@@ -1529,6 +1575,11 @@ def _empty_backend_latency_summary() -> Dict[str, object]:
         "duration_ms_per_1k_prompt_tokens": 0.0,
         "frontend_cache_hits": 0,
         "frontend_cache_hit_rate": 0.0,
+        "total_system_prompt_tokens_estimate": 0,
+        "total_user_prompt_tokens_estimate": 0,
+        "total_ordered_segment_tokens": 0,
+        "total_request_segment_tokens": 0,
+        "total_assembled_prompt_tokens_estimate": 0,
         "step_rows": [],
     }
 
@@ -1879,6 +1930,11 @@ def _aggregate_backend_latencies(
                     "total_completion_tokens": 0,
                     "total_tokens": 0,
                     "frontend_cache_hits": 0,
+                    "system_prompt_tokens_estimate": 0,
+                    "user_prompt_tokens_estimate": 0,
+                    "ordered_segment_tokens": 0,
+                    "request_segment_tokens": 0,
+                    "assembled_prompt_tokens_estimate": 0,
                 },
             )
             bucket["request_count"] = int(bucket["request_count"]) + int(row["request_count"])
@@ -1895,6 +1951,21 @@ def _aggregate_backend_latencies(
             bucket["frontend_cache_hits"] = int(bucket["frontend_cache_hits"]) + int(
                 row.get("frontend_cache_hits", 0)
             )
+            bucket["system_prompt_tokens_estimate"] = int(
+                bucket["system_prompt_tokens_estimate"]
+            ) + int(row.get("system_prompt_tokens_estimate", 0))
+            bucket["user_prompt_tokens_estimate"] = int(
+                bucket["user_prompt_tokens_estimate"]
+            ) + int(row.get("user_prompt_tokens_estimate", 0))
+            bucket["ordered_segment_tokens"] = int(bucket["ordered_segment_tokens"]) + int(
+                row.get("ordered_segment_tokens", 0)
+            )
+            bucket["request_segment_tokens"] = int(bucket["request_segment_tokens"]) + int(
+                row.get("request_segment_tokens", 0)
+            )
+            bucket["assembled_prompt_tokens_estimate"] = int(
+                bucket["assembled_prompt_tokens_estimate"]
+            ) + int(row.get("assembled_prompt_tokens_estimate", 0))
 
     step_rows = []
     for key in sorted(grouped):
@@ -1924,6 +1995,13 @@ def _aggregate_backend_latencies(
                 "frontend_cache_hit_rate": (
                     int(bucket["frontend_cache_hits"]) / request_count if request_count else 0.0
                 ),
+                "system_prompt_tokens_estimate": int(bucket["system_prompt_tokens_estimate"]),
+                "user_prompt_tokens_estimate": int(bucket["user_prompt_tokens_estimate"]),
+                "ordered_segment_tokens": int(bucket["ordered_segment_tokens"]),
+                "request_segment_tokens": int(bucket["request_segment_tokens"]),
+                "assembled_prompt_tokens_estimate": int(
+                    bucket["assembled_prompt_tokens_estimate"]
+                ),
             }
         )
 
@@ -1936,6 +2014,26 @@ def _aggregate_backend_latencies(
     total_tokens = sum(int(latency["total_tokens"]) for latency in backend_latencies)
     frontend_cache_hits = sum(
         int(latency.get("frontend_cache_hits", 0)) for latency in backend_latencies
+    )
+    total_system_prompt_tokens_estimate = sum(
+        int(latency.get("total_system_prompt_tokens_estimate", 0))
+        for latency in backend_latencies
+    )
+    total_user_prompt_tokens_estimate = sum(
+        int(latency.get("total_user_prompt_tokens_estimate", 0))
+        for latency in backend_latencies
+    )
+    total_ordered_segment_tokens = sum(
+        int(latency.get("total_ordered_segment_tokens", 0))
+        for latency in backend_latencies
+    )
+    total_request_segment_tokens = sum(
+        int(latency.get("total_request_segment_tokens", 0))
+        for latency in backend_latencies
+    )
+    total_assembled_prompt_tokens_estimate = sum(
+        int(latency.get("total_assembled_prompt_tokens_estimate", 0))
+        for latency in backend_latencies
     )
 
     return {
@@ -1957,6 +2055,11 @@ def _aggregate_backend_latencies(
         "frontend_cache_hit_rate": (
             frontend_cache_hits / request_count if request_count else 0.0
         ),
+        "total_system_prompt_tokens_estimate": total_system_prompt_tokens_estimate,
+        "total_user_prompt_tokens_estimate": total_user_prompt_tokens_estimate,
+        "total_ordered_segment_tokens": total_ordered_segment_tokens,
+        "total_request_segment_tokens": total_request_segment_tokens,
+        "total_assembled_prompt_tokens_estimate": total_assembled_prompt_tokens_estimate,
         "step_rows": step_rows,
     }
 
