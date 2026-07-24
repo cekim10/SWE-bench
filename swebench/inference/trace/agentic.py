@@ -222,6 +222,128 @@ def build_demo_instance() -> WorkflowInstance:
     )
 
 
+def build_deep_research_demo_instance() -> WorkflowInstance:
+    return WorkflowInstance(
+        instance_id="deep-research__demo-1",
+        problem_statement=(
+            "Write a concise survey on speculative decoding for LLM inference, covering "
+            "core ideas, system tradeoffs, and open implementation challenges."
+        ),
+        file_contents={
+            "papers/speculative_decoding_overview.md": (
+                "Speculative decoding accelerates generation by drafting multiple tokens with "
+                "a cheap proposal model and then verifying them with a stronger target model. "
+                "The main benefit depends on proposal accuracy, verification batching, and "
+                "scheduler overheads. Common tradeoffs include wasted verification work, "
+                "proposal-target mismatch, and memory pressure from maintaining additional "
+                "model state.\n"
+            ),
+            "papers/system_tradeoffs.md": (
+                "Serving systems must balance proposal quality, batch formation, and KV-cache "
+                "reuse. Throughput gains can disappear when draft quality is low or when "
+                "verification causes pipeline bubbles. Integration with prefix caching and "
+                "offloading is promising, but scheduler complexity rises with heterogeneous "
+                "request lengths and evolving context windows.\n"
+            ),
+            "papers/open_problems.md": (
+                "Open problems include adaptive proposal depth, multi-tenant fairness, "
+                "token-level fallback strategies, and interactions with retrieval-augmented "
+                "or agentic workloads. Measuring end-to-end latency requires separating "
+                "frontend orchestration costs from backend prefill and decode work.\n"
+            ),
+        },
+        readmes={
+            "README.md": (
+                "Treat each markdown file as one retrieved source document. The final answer "
+                "should synthesize repeated evidence, note systems implications, and preserve "
+                "a stable outline across multiple planner/writer iterations."
+            )
+        },
+    )
+
+
+@dataclass(frozen=True)
+class OpenDeepResearchPromptPack:
+    repo_path: Path
+    clarify_with_user_instructions: str
+    transform_messages_into_research_topic_prompt: str
+    lead_researcher_prompt: str
+    research_system_prompt: str
+    compress_research_system_prompt: str
+    compress_research_simple_human_message: str
+    final_report_generation_prompt: str
+
+
+def _default_open_deep_research_repo_path() -> Path | None:
+    candidate = Path(__file__).resolve().parents[3] / ".external" / "open_deep_research"
+    return candidate if candidate.exists() else None
+
+
+def load_open_deep_research_prompt_pack(
+    repo_path: str | Path | None = None,
+) -> OpenDeepResearchPromptPack:
+    resolved_repo_path = (
+        Path(repo_path).expanduser().resolve()
+        if repo_path is not None
+        else _default_open_deep_research_repo_path()
+    )
+    if resolved_repo_path is None or not resolved_repo_path.exists():
+        raise RuntimeError(
+            "open_deep_research repo not found. Clone langchain-ai/open_deep_research "
+            "and pass --open_deep_research_path, or place it at "
+            "'./.external/open_deep_research'."
+        )
+
+    langgraph_manifest = resolved_repo_path / "langgraph.json"
+    prompts_path = (
+        resolved_repo_path / "src" / "open_deep_research" / "prompts.py"
+    )
+    if not langgraph_manifest.exists() or not prompts_path.exists():
+        raise RuntimeError(
+            f"{resolved_repo_path} does not look like an open_deep_research checkout"
+        )
+
+    module_name = (
+        "swebench_external_open_deep_research_prompts_"
+        + sha256(str(prompts_path).encode("utf-8")).hexdigest()[:12]
+    )
+    spec = importlib.util.spec_from_file_location(module_name, prompts_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load prompts from {prompts_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    required_fields = [
+        "clarify_with_user_instructions",
+        "transform_messages_into_research_topic_prompt",
+        "lead_researcher_prompt",
+        "research_system_prompt",
+        "compress_research_system_prompt",
+        "compress_research_simple_human_message",
+        "final_report_generation_prompt",
+    ]
+    missing = [field_name for field_name in required_fields if not hasattr(module, field_name)]
+    if missing:
+        raise RuntimeError(
+            f"open_deep_research prompts missing expected fields: {', '.join(sorted(missing))}"
+        )
+
+    return OpenDeepResearchPromptPack(
+        repo_path=resolved_repo_path,
+        clarify_with_user_instructions=str(module.clarify_with_user_instructions),
+        transform_messages_into_research_topic_prompt=str(
+            module.transform_messages_into_research_topic_prompt
+        ),
+        lead_researcher_prompt=str(module.lead_researcher_prompt),
+        research_system_prompt=str(module.research_system_prompt),
+        compress_research_system_prompt=str(module.compress_research_system_prompt),
+        compress_research_simple_human_message=str(
+            module.compress_research_simple_human_message
+        ),
+        final_report_generation_prompt=str(module.final_report_generation_prompt),
+    )
+
+
 class ModelBackend(Protocol):
     name: str
 
@@ -346,6 +468,36 @@ class StubModelBackend:
                 "- Patch matches the stated invariant.\n"
                 "- No additional changes required before verification.\n"
                 )
+        elif step_name == "research_planner":
+            text = (
+                f"Research Plan v{iteration}:\n"
+                "1. Reframe the survey question around systems tradeoffs.\n"
+                "2. Prioritize evidence about proposal accuracy, verification cost, and scheduler overhead.\n"
+                "3. Update the outline to separate mechanisms, systems implications, and open problems.\n"
+            )
+        elif step_name == "research_reader":
+            text = (
+                f"Reading Note v{iteration}:\n"
+                "- Proposal quality drives the realized speedup.\n"
+                "- Verification batching and KV reuse determine backend efficiency.\n"
+                "- Frontend orchestration overhead can hide backend gains in agentic settings.\n"
+            )
+        elif step_name == "research_writer":
+            text = (
+                f"Survey Draft v{iteration}:\n"
+                "Speculative decoding speeds up inference by drafting tokens with a cheap proposer "
+                "and verifying them against a stronger target model. In practice, observed gains "
+                "depend on proposal accuracy, batched verification, and scheduler efficiency. "
+                "Systems challenges include balancing KV reuse, avoiding verification bubbles, "
+                "and separating frontend request overhead from backend prefill savings.\n"
+            )
+        elif step_name == "research_critic":
+            text = (
+                f"Critique v{iteration}:\n"
+                "- Clarify that not all latency savings come from model-side compute.\n"
+                "- Strengthen the connection between evidence reuse and serving-layer compatibility costs.\n"
+                "- Keep the final draft explicit about open runtime questions.\n"
+            )
         else:
             raise ValueError(f"unknown step_name {step_name!r}")
 
@@ -2117,6 +2269,76 @@ class TracedAgentRunner:
             "Provide concise critique to drive the next plan revision."
         )
 
+    def _research_planner_system_prompt(self) -> str:
+        return (
+            "You are a deep research planner. Maintain a stable survey outline while "
+            "integrating persistent evidence and the latest critique."
+        )
+
+    def _research_planner_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Research iteration: {iteration}\n"
+            f"Question:\n{instance.problem_statement}\n\n"
+            "Revise the outline and identify the most important evidence to emphasize next."
+        )
+
+    def _research_reader_system_prompt(self) -> str:
+        return (
+            "You are a research reader. Extract concise systems-relevant findings from the "
+            "currently focused evidence."
+        )
+
+    def _research_reader_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+        source_name: str,
+    ) -> str:
+        return (
+            f"Research iteration: {iteration}\n"
+            f"Question:\n{instance.problem_statement}\n\n"
+            f"Focused source: {source_name}\n"
+            "Produce a short note that can be reused by later planner and writer steps."
+        )
+
+    def _research_writer_system_prompt(self) -> str:
+        return (
+            "You are a technical writer. Expand the current survey draft using the active "
+            "plan and accumulated reading notes."
+        )
+
+    def _research_writer_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Research iteration: {iteration}\n"
+            f"Question:\n{instance.problem_statement}\n\n"
+            "Write the next concise survey draft while preserving the stable outline."
+        )
+
+    def _research_critic_system_prompt(self) -> str:
+        return (
+            "You are a critic. Review the current survey draft and identify the next high-value "
+            "revision needed for clarity or systems rigor."
+        )
+
+    def _research_critic_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Research iteration: {iteration}\n"
+            f"Question:\n{instance.problem_statement}\n\n"
+            "Provide one concise critique that should influence the next planning pass."
+        )
+
 
 class LangGraphStyleTracedAgentRunner(TracedAgentRunner):
     def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
@@ -3041,6 +3263,671 @@ class SyntheticStressTracedAgentRunner(TracedAgentRunner):
                 "summary": validation.summary,
             },
         }
+
+
+class DeepResearchTracedAgentRunner(TracedAgentRunner):
+    def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
+        trace_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}.jsonl"
+        runtime_event_path = (
+            self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}_runtime.jsonl"
+        )
+        backend_call_path = (
+            self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}_backend_calls.jsonl"
+        )
+        selected_files = self._select_files(instance)
+        source_files = dict(sorted({**instance.readmes, **selected_files}.items()))
+        self._reset_monolithic_prompt_runtime_state()
+
+        with TraceLogger(
+            trace_path,
+            workflow_id=instance.instance_id,
+            tenant_id=self.tenant_id,
+        ) as trace:
+            materializer = SegmentRuntime(
+                reclaim_grace_by_role=self._reclaim_grace_by_role,
+            )
+            system_prompt = self._research_planner_system_prompt()
+            system_state = trace.create_state(
+                state_id="system_v1",
+                logical_key="prompt/system",
+                state_type="agent_anchor",
+                size_bytes=size_bytes(system_prompt),
+                token_count=approx_token_count(system_prompt),
+                producer="runner",
+                materialization="HBM",
+                metadata=module_metadata(
+                    context_module="system",
+                    lifecycle_class="long",
+                    is_immutable=True,
+                    is_shared=True,
+                    is_ephemeral=False,
+                    update_cause="static",
+                    agent_family="deep_research",
+                ),
+            )
+            self._register_runtime_segment(
+                materializer=materializer,
+                handle=system_state,
+                workflow_id=instance.instance_id,
+                module="system",
+                role="system",
+                text=system_prompt,
+                materialization="HBM",
+                is_shared=True,
+                is_immutable=True,
+                is_ephemeral=False,
+                metadata={"agent_family": "deep_research"},
+            )
+            task_state = trace.create_state(
+                state_id="task_v1",
+                logical_key="prompt/task",
+                state_type="conversation_history",
+                size_bytes=size_bytes(instance.problem_statement),
+                token_count=approx_token_count(instance.problem_statement),
+                producer="runner",
+                materialization="HBM",
+                metadata=module_metadata(
+                    context_module="task",
+                    lifecycle_class="long",
+                    is_immutable=True,
+                    is_shared=True,
+                    is_ephemeral=False,
+                    update_cause="task_fixed",
+                    agent_family="deep_research",
+                ),
+            )
+            self._register_runtime_segment(
+                materializer=materializer,
+                handle=task_state,
+                workflow_id=instance.instance_id,
+                module="task",
+                role="task",
+                text=instance.problem_statement,
+                materialization="HBM",
+                is_shared=True,
+                is_immutable=True,
+                is_ephemeral=False,
+                metadata={"agent_family": "deep_research"},
+            )
+            source_states = self._create_text_states(
+                trace=trace,
+                state_type="retrieved_document",
+                producer="retriever",
+                logical_prefix="research_source",
+                files=source_files,
+                materialization="CPU",
+                context_module="evidence",
+                lifecycle_class="long",
+                is_immutable=True,
+                is_shared=True,
+                is_ephemeral=False,
+                update_cause="retrieval_seed",
+            )
+            for state, (_, contents) in zip(source_states, sorted(source_files.items())):
+                self._register_runtime_segment(
+                    materializer=materializer,
+                    handle=state,
+                    workflow_id=instance.instance_id,
+                    module="evidence",
+                    role="evidence",
+                    text=contents,
+                    materialization="CPU",
+                    is_shared=True,
+                    is_immutable=True,
+                    is_ephemeral=False,
+                    metadata={"agent_family": "deep_research"},
+                )
+
+            live_state_ids = {system_state.state_id, task_state.state_id}
+            live_state_ids.update(state.state_id for state in source_states)
+            note_state_ids: List[str] = []
+            current_plan_id: str | None = None
+            current_draft_id: str | None = None
+            current_critique_id: str | None = None
+            final_plan_text = ""
+            final_draft_text = ""
+            final_critique_text = ""
+
+            source_state_cycle = list(source_states) or []
+
+            for iteration in range(1, self.max_iterations + 1):
+                planner_segments = [
+                    self._segment(system_state.state_id, "system", role="system"),
+                    self._segment(task_state.state_id, "task", role="task"),
+                ]
+                planner_segments.extend(
+                    self._segment(state.state_id, "evidence", role="evidence")
+                    for state in source_states
+                )
+                planner_segments.extend(
+                    self._segment(state_id, "summary", role="summary")
+                    for state_id in note_state_ids
+                )
+                if current_draft_id is not None:
+                    planner_segments.append(
+                        self._segment(
+                            current_draft_id,
+                            "artifact",
+                            role="artifact",
+                            update_cause="draft_feedback",
+                        )
+                    )
+                if current_critique_id is not None:
+                    planner_segments.append(
+                        self._segment(
+                            current_critique_id,
+                            "scratchpad",
+                            role="scratchpad",
+                            update_cause="critic_feedback",
+                        )
+                    )
+                prompt_mode, prompt_group, segment_request, snapshot = self._prepare_langgraph_prompt_runtime(
+                    materializer=materializer,
+                    trace=trace,
+                    workflow_id=instance.instance_id,
+                    consumer="research_planner",
+                    step_name="research_planner",
+                    prompt_id=f"research-planner-{iteration}",
+                    system_prompt=self._research_planner_system_prompt(),
+                    user_prompt=self._research_planner_user_prompt(instance, iteration),
+                    segments=planner_segments,
+                    metadata={"hook": "research.planner", "iteration": iteration},
+                )
+                plan_text = self.backend.complete(
+                    step_name="research_planner",
+                    system_prompt=self._research_planner_system_prompt(),
+                    user_prompt=self._research_planner_user_prompt(instance, iteration),
+                    iteration=iteration,
+                    instance=instance,
+                    prompt_mode=prompt_mode,
+                    prompt_group=prompt_group,
+                    segment_request=segment_request,
+                    materializer_snapshot=snapshot,
+                )
+                plan_state = trace.create_state(
+                    state_id=f"research_plan_v{iteration}",
+                    logical_key="research/planner/plan",
+                    state_type="plan",
+                    size_bytes=size_bytes(plan_text),
+                    token_count=approx_token_count(plan_text),
+                    producer="research_planner",
+                    parent_state_ids=(
+                        [current_critique_id] if current_critique_id is not None else None
+                    ),
+                    materialization="HBM",
+                    metadata=module_metadata(
+                        context_module="plan",
+                        lifecycle_class="medium",
+                        is_immutable=False,
+                        is_shared=False,
+                        is_ephemeral=False,
+                        update_cause="research_replan",
+                        iteration=iteration,
+                        agent_family="deep_research",
+                    ),
+                )
+                self._register_runtime_segment(
+                    materializer=materializer,
+                    handle=plan_state,
+                    workflow_id=instance.instance_id,
+                    module="plan",
+                    role="plan",
+                    text=plan_text,
+                    materialization="HBM",
+                    is_shared=False,
+                    is_immutable=False,
+                    is_ephemeral=False,
+                    metadata={"agent_family": "deep_research"},
+                )
+                live_state_ids.add(plan_state.state_id)
+                if current_plan_id is not None:
+                    trace.supersede_state(
+                        current_plan_id,
+                        plan_state.state_id,
+                        metadata={"iteration": iteration},
+                    )
+                    trace.release_state(
+                        current_plan_id,
+                        consumer="research_planner",
+                        metadata={"reason": "research_replan"},
+                    )
+                    self._release_runtime_segment(
+                        materializer=materializer,
+                        state_id=current_plan_id,
+                    )
+                    live_state_ids.discard(current_plan_id)
+                current_plan_id = plan_state.state_id
+                final_plan_text = plan_text
+
+                focused_source = source_state_cycle[(iteration - 1) % len(source_state_cycle)]
+                focused_source_name = focused_source.logical_key.split("/")[-1]
+                reader_segments = [
+                    self._segment(system_state.state_id, "system", role="system"),
+                    self._segment(task_state.state_id, "task", role="task"),
+                    self._segment(current_plan_id, "plan", role="plan"),
+                    self._segment(focused_source.state_id, "evidence", role="evidence"),
+                ]
+                prompt_mode, prompt_group, segment_request, snapshot = self._prepare_langgraph_prompt_runtime(
+                    materializer=materializer,
+                    trace=trace,
+                    workflow_id=instance.instance_id,
+                    consumer="research_reader",
+                    step_name="research_reader",
+                    prompt_id=f"research-reader-{iteration}",
+                    system_prompt=self._research_reader_system_prompt(),
+                    user_prompt=self._research_reader_user_prompt(
+                        instance,
+                        iteration,
+                        focused_source_name,
+                    ),
+                    segments=reader_segments,
+                    metadata={
+                        "hook": "research.reader",
+                        "iteration": iteration,
+                        "source": focused_source_name,
+                    },
+                )
+                note_text = self.backend.complete(
+                    step_name="research_reader",
+                    system_prompt=self._research_reader_system_prompt(),
+                    user_prompt=self._research_reader_user_prompt(
+                        instance,
+                        iteration,
+                        focused_source_name,
+                    ),
+                    iteration=iteration,
+                    instance=instance,
+                    prompt_mode=prompt_mode,
+                    prompt_group=prompt_group,
+                    segment_request=segment_request,
+                    materializer_snapshot=snapshot,
+                )
+                note_state = trace.create_state(
+                    state_id=f"research_note_v{iteration}",
+                    logical_key=f"research/reader/note/{focused_source_name}",
+                    state_type="summary",
+                    size_bytes=size_bytes(note_text),
+                    token_count=approx_token_count(note_text),
+                    producer="research_reader",
+                    parent_state_ids=[current_plan_id, focused_source.state_id],
+                    materialization="CPU",
+                    metadata=module_metadata(
+                        context_module="summary",
+                        lifecycle_class="medium",
+                        is_immutable=False,
+                        is_shared=False,
+                        is_ephemeral=False,
+                        update_cause="source_read",
+                        iteration=iteration,
+                        source=focused_source_name,
+                        agent_family="deep_research",
+                    ),
+                )
+                self._register_runtime_segment(
+                    materializer=materializer,
+                    handle=note_state,
+                    workflow_id=instance.instance_id,
+                    module="summary",
+                    role="summary",
+                    text=note_text,
+                    materialization="CPU",
+                    is_shared=False,
+                    is_immutable=False,
+                    is_ephemeral=False,
+                    metadata={"agent_family": "deep_research"},
+                )
+                live_state_ids.add(note_state.state_id)
+                note_state_ids.append(note_state.state_id)
+
+                writer_segments = [
+                    self._segment(system_state.state_id, "system", role="system"),
+                    self._segment(task_state.state_id, "task", role="task"),
+                    self._segment(current_plan_id, "plan", role="plan"),
+                ]
+                writer_segments.extend(
+                    self._segment(state_id, "summary", role="summary")
+                    for state_id in note_state_ids
+                )
+                if current_draft_id is not None:
+                    writer_segments.append(
+                        self._segment(
+                            current_draft_id,
+                            "artifact",
+                            role="artifact",
+                            update_cause="draft_revision",
+                        )
+                    )
+                prompt_mode, prompt_group, segment_request, snapshot = self._prepare_langgraph_prompt_runtime(
+                    materializer=materializer,
+                    trace=trace,
+                    workflow_id=instance.instance_id,
+                    consumer="research_writer",
+                    step_name="research_writer",
+                    prompt_id=f"research-writer-{iteration}",
+                    system_prompt=self._research_writer_system_prompt(),
+                    user_prompt=self._research_writer_user_prompt(instance, iteration),
+                    segments=writer_segments,
+                    metadata={"hook": "research.writer", "iteration": iteration},
+                )
+                draft_text = self.backend.complete(
+                    step_name="research_writer",
+                    system_prompt=self._research_writer_system_prompt(),
+                    user_prompt=self._research_writer_user_prompt(instance, iteration),
+                    iteration=iteration,
+                    instance=instance,
+                    prompt_mode=prompt_mode,
+                    prompt_group=prompt_group,
+                    segment_request=segment_request,
+                    materializer_snapshot=snapshot,
+                )
+                draft_state = trace.create_state(
+                    state_id=f"research_draft_v{iteration}",
+                    logical_key="research/writer/draft",
+                    state_type="generated_artifact",
+                    size_bytes=size_bytes(draft_text),
+                    token_count=approx_token_count(draft_text),
+                    producer="research_writer",
+                    parent_state_ids=[current_plan_id, *note_state_ids],
+                    materialization="HBM",
+                    metadata=module_metadata(
+                        context_module="artifact",
+                        lifecycle_class="medium",
+                        is_immutable=False,
+                        is_shared=False,
+                        is_ephemeral=False,
+                        update_cause="draft_revision",
+                        iteration=iteration,
+                        agent_family="deep_research",
+                    ),
+                )
+                self._register_runtime_segment(
+                    materializer=materializer,
+                    handle=draft_state,
+                    workflow_id=instance.instance_id,
+                    module="artifact",
+                    role="artifact",
+                    text=draft_text,
+                    materialization="HBM",
+                    is_shared=False,
+                    is_immutable=False,
+                    is_ephemeral=False,
+                    metadata={"agent_family": "deep_research"},
+                )
+                live_state_ids.add(draft_state.state_id)
+                if current_draft_id is not None:
+                    trace.supersede_state(
+                        current_draft_id,
+                        draft_state.state_id,
+                        metadata={"iteration": iteration},
+                    )
+                    trace.release_state(
+                        current_draft_id,
+                        consumer="research_writer",
+                        metadata={"reason": "draft_refresh"},
+                    )
+                    self._release_runtime_segment(
+                        materializer=materializer,
+                        state_id=current_draft_id,
+                    )
+                    live_state_ids.discard(current_draft_id)
+                current_draft_id = draft_state.state_id
+                final_draft_text = draft_text
+
+                critic_segments = [
+                    self._segment(system_state.state_id, "system", role="system"),
+                    self._segment(task_state.state_id, "task", role="task"),
+                    self._segment(current_plan_id, "plan", role="plan"),
+                    self._segment(current_draft_id, "artifact", role="artifact"),
+                ]
+                critic_segments.extend(
+                    self._segment(state_id, "summary", role="summary")
+                    for state_id in note_state_ids
+                )
+                prompt_mode, prompt_group, segment_request, snapshot = self._prepare_langgraph_prompt_runtime(
+                    materializer=materializer,
+                    trace=trace,
+                    workflow_id=instance.instance_id,
+                    consumer="research_critic",
+                    step_name="research_critic",
+                    prompt_id=f"research-critic-{iteration}",
+                    system_prompt=self._research_critic_system_prompt(),
+                    user_prompt=self._research_critic_user_prompt(instance, iteration),
+                    segments=critic_segments,
+                    metadata={"hook": "research.critic", "iteration": iteration},
+                )
+                critique_text = self.backend.complete(
+                    step_name="research_critic",
+                    system_prompt=self._research_critic_system_prompt(),
+                    user_prompt=self._research_critic_user_prompt(instance, iteration),
+                    iteration=iteration,
+                    instance=instance,
+                    prompt_mode=prompt_mode,
+                    prompt_group=prompt_group,
+                    segment_request=segment_request,
+                    materializer_snapshot=snapshot,
+                )
+                critique_state = trace.create_state(
+                    state_id=f"research_critique_v{iteration}",
+                    logical_key="research/critic/feedback",
+                    state_type="error_diagnostic",
+                    size_bytes=size_bytes(critique_text),
+                    token_count=approx_token_count(critique_text),
+                    producer="research_critic",
+                    parent_state_ids=[current_draft_id],
+                    materialization="CPU",
+                    metadata=module_metadata(
+                        context_module="scratchpad",
+                        lifecycle_class="short",
+                        is_immutable=False,
+                        is_shared=False,
+                        is_ephemeral=True,
+                        update_cause="draft_feedback",
+                        iteration=iteration,
+                        agent_family="deep_research",
+                    ),
+                )
+                self._register_runtime_segment(
+                    materializer=materializer,
+                    handle=critique_state,
+                    workflow_id=instance.instance_id,
+                    module="scratchpad",
+                    role="scratchpad",
+                    text=critique_text,
+                    materialization="CPU",
+                    is_shared=False,
+                    is_immutable=False,
+                    is_ephemeral=True,
+                    metadata={"agent_family": "deep_research"},
+                )
+                live_state_ids.add(critique_state.state_id)
+                if current_critique_id is not None:
+                    trace.supersede_state(
+                        current_critique_id,
+                        critique_state.state_id,
+                        metadata={"iteration": iteration},
+                    )
+                    trace.release_state(
+                        current_critique_id,
+                        consumer="research_critic",
+                        metadata={"reason": "critique_refresh"},
+                    )
+                    self._release_runtime_segment(
+                        materializer=materializer,
+                        state_id=current_critique_id,
+                    )
+                    live_state_ids.discard(current_critique_id)
+                current_critique_id = critique_state.state_id
+                final_critique_text = critique_text
+
+            for state_id in sorted(live_state_ids):
+                trace.release_state(
+                    state_id,
+                    consumer="workflow",
+                    metadata={"reason": "workflow_end"},
+                )
+                self._release_runtime_segment(materializer=materializer, state_id=state_id)
+            if self.prompt_runtime_mode == "monolithic":
+                self._release_monolithic_prompt_runtime(materializer=materializer)
+
+        events = load_trace_events(trace_path)
+        validation = validate_trace_events(events)
+        runtime_summary = self._runtime_event_summary(materializer)
+        backend_call_records = self.backend.drain_call_records()
+        backend_call_summary = self._backend_call_summary(backend_call_records)
+        self._write_runtime_events(
+            materializer=materializer,
+            runtime_event_path=runtime_event_path,
+            workflow_id=instance.instance_id,
+            agent_family="deep_research",
+        )
+        self._write_backend_call_records(
+            backend_call_path=backend_call_path,
+            workflow_id=instance.instance_id,
+            call_records=backend_call_records,
+        )
+        return {
+            "instance_id": instance.instance_id,
+            "status": "COMPLETED",
+            "provider": getattr(self.backend, "name", self.backend.__class__.__name__),
+            "agent_family": "deep_research",
+            "prompt_runtime_mode": self.prompt_runtime_mode,
+            "plan": final_plan_text,
+            "patch": final_draft_text,
+            "verification": final_critique_text,
+            "trace_path": str(trace_path),
+            "runtime_event_path": str(runtime_event_path),
+            "runtime_event_summary": runtime_summary,
+            "backend_call_path": str(backend_call_path),
+            "backend_call_summary": backend_call_summary,
+            "trace_validation": {
+                "is_valid": validation.is_valid,
+                "errors": validation.errors,
+                "summary": validation.summary,
+            },
+        }
+
+
+class OpenDeepResearchTracedAgentRunner(DeepResearchTracedAgentRunner):
+    def __init__(
+        self,
+        *,
+        backend: ModelBackend,
+        trace_dir: str | Path,
+        tenant_id: str = "local",
+        max_iterations: int = 2,
+        max_files: int = 5,
+        prompt_runtime_mode: str = "monolithic",
+        open_deep_research_path: str | Path | None = None,
+    ) -> None:
+        super().__init__(
+            backend=backend,
+            trace_dir=trace_dir,
+            tenant_id=tenant_id,
+            max_iterations=max_iterations,
+            max_files=max_files,
+            prompt_runtime_mode=prompt_runtime_mode,
+        )
+        self._open_deep_research_prompts = load_open_deep_research_prompt_pack(
+            open_deep_research_path
+        )
+
+    def _open_deep_research_today(self) -> str:
+        now = time.localtime()
+        return f"{time.strftime('%a %b', now)} {now.tm_mday}, {time.strftime('%Y', now)}"
+
+    def _open_deep_research_messages(self, instance: WorkflowInstance) -> str:
+        return (
+            "Human: "
+            f"{instance.problem_statement}\n"
+            "Assistant: Begin deep research using the provided context."
+        )
+
+    def _research_planner_system_prompt(self) -> str:
+        return self._open_deep_research_prompts.lead_researcher_prompt.format(
+            date=self._open_deep_research_today(),
+            max_concurrent_research_units=1,
+            max_researcher_iterations=self.max_iterations,
+        )
+
+    def _research_planner_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        research_brief = (
+            self._open_deep_research_prompts.transform_messages_into_research_topic_prompt.format(
+                messages=self._open_deep_research_messages(instance),
+                date=self._open_deep_research_today(),
+            )
+        )
+        return (
+            f"{research_brief}\n\n"
+            f"Supervisor iteration: {iteration}\n"
+            "Use the already provided source segments to decide the next research emphasis."
+        )
+
+    def _research_reader_system_prompt(self) -> str:
+        return self._open_deep_research_prompts.research_system_prompt.format(
+            mcp_prompt="",
+            date=self._open_deep_research_today(),
+        )
+
+    def _research_reader_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+        source_name: str,
+    ) -> str:
+        return (
+            f"Research topic:\n{instance.problem_statement}\n\n"
+            f"Focused source: {source_name}\n"
+            f"Research iteration: {iteration}\n"
+            "Use the provided evidence segment instead of web search, extract systems-relevant "
+            "facts, and preserve concrete claims that should survive into the final report."
+        )
+
+    def _research_writer_system_prompt(self) -> str:
+        return self._open_deep_research_prompts.compress_research_system_prompt.format(
+            date=self._open_deep_research_today()
+        )
+
+    def _research_writer_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"{self._open_deep_research_prompts.compress_research_simple_human_message}\n\n"
+            f"Research topic:\n{instance.problem_statement}\n\n"
+            f"Compression iteration: {iteration}\n"
+            "Clean and consolidate the currently active findings into reusable notes."
+        )
+
+    def _research_critic_system_prompt(self) -> str:
+        return (
+            "You are the final report generator for the open_deep_research workflow. "
+            "Synthesize the active brief and accumulated notes into the next report revision."
+        )
+
+    def _research_critic_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return self._open_deep_research_prompts.final_report_generation_prompt.format(
+            research_brief=instance.problem_statement,
+            messages=self._open_deep_research_messages(instance),
+            findings=(
+                "Use the active plan, accumulated summary segments, and current draft segment "
+                "that were provided through the runtime context."
+            ),
+        ) + f"\n\nReport iteration: {iteration}\n"
+
+    def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
+        result = super().run_instance(instance)
+        result["workload_source"] = "open_deep_research"
+        result["open_deep_research_path"] = str(self._open_deep_research_prompts.repo_path)
+        return result
 
 
 class LangGraphTracedAgentRunner(TracedAgentRunner):

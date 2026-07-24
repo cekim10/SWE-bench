@@ -5,6 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from textwrap import dedent
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -186,6 +187,119 @@ class TraceAgenticRunnerTests(unittest.TestCase):
             self.assertTrue(Path(result["backend_call_path"]).exists())
             self.assertGreater(result["backend_call_summary"]["request_count"], 0)
             self.assertGreater(len(backend.calls), 0)
+
+    def test_deep_research_runner_emits_runtime_and_backend_logs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = self.CapturingBackend()
+            runner = AGENTIC.DeepResearchTracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=3,
+                max_files=3,
+                prompt_runtime_mode="segment_aware",
+            )
+            result = runner.run_instance(AGENTIC.build_deep_research_demo_instance())
+            self.assertEqual(result["status"], "COMPLETED")
+            self.assertEqual(result["agent_family"], "deep_research")
+            self.assertTrue(result["trace_validation"]["is_valid"])
+            self.assertTrue(Path(result["runtime_event_path"]).exists())
+            self.assertTrue(Path(result["backend_call_path"]).exists())
+            self.assertGreater(result["backend_call_summary"]["request_count"], 0)
+            self.assertGreater(len(backend.calls), 0)
+
+            events = AGENTIC.load_trace_events(result["trace_path"])
+            producers = {event.get("producer") for event in events if "producer" in event}
+            logical_keys = {event.get("logical_key") for event in events if "logical_key" in event}
+            self.assertIn("research_planner", producers)
+            self.assertIn("research_reader", producers)
+            self.assertIn("research_writer", producers)
+            self.assertIn("research_critic", producers)
+            self.assertIn("research/planner/plan", logical_keys)
+            self.assertIn("research/writer/draft", logical_keys)
+            self.assertIn("research/critic/feedback", logical_keys)
+
+    def test_load_open_deep_research_prompt_pack_from_repo_checkout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "open_deep_research"
+            prompts_dir = repo_root / "src" / "open_deep_research"
+            prompts_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "langgraph.json").write_text(
+                '{"graphs": {"Deep Researcher": "./src/open_deep_research/deep_researcher.py:deep_researcher"}}',
+                encoding="utf-8",
+            )
+            (prompts_dir / "prompts.py").write_text(
+                dedent(
+                    '''
+                    clarify_with_user_instructions = "clarify {messages} {date}"
+                    transform_messages_into_research_topic_prompt = "brief {messages} {date}"
+                    lead_researcher_prompt = "lead {date} {max_concurrent_research_units} {max_researcher_iterations}"
+                    research_system_prompt = "research {mcp_prompt} {date}"
+                    compress_research_system_prompt = "compress {date}"
+                    compress_research_simple_human_message = "cleanup"
+                    final_report_generation_prompt = "final {research_brief} {messages} {findings}"
+                    '''
+                ),
+                encoding="utf-8",
+            )
+            prompt_pack = AGENTIC.load_open_deep_research_prompt_pack(repo_root)
+            self.assertEqual(prompt_pack.repo_path, repo_root.resolve())
+            self.assertIn("lead", prompt_pack.lead_researcher_prompt)
+
+    def test_open_deep_research_runner_uses_upstream_prompt_pack(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "open_deep_research"
+            prompts_dir = repo_root / "src" / "open_deep_research"
+            prompts_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "langgraph.json").write_text(
+                '{"graphs": {"Deep Researcher": "./src/open_deep_research/deep_researcher.py:deep_researcher"}}',
+                encoding="utf-8",
+            )
+            (prompts_dir / "prompts.py").write_text(
+                dedent(
+                    '''
+                    clarify_with_user_instructions = "clarify {messages} {date}"
+                    transform_messages_into_research_topic_prompt = "brief {messages} {date}"
+                    lead_researcher_prompt = "UPSTREAM_SUPERVISOR {date} {max_concurrent_research_units} {max_researcher_iterations}"
+                    research_system_prompt = "UPSTREAM_RESEARCH {mcp_prompt} {date}"
+                    compress_research_system_prompt = "UPSTREAM_COMPRESS {date}"
+                    compress_research_simple_human_message = "UPSTREAM_CLEANUP"
+                    final_report_generation_prompt = "UPSTREAM_FINAL {research_brief} {messages} {findings}"
+                    '''
+                ),
+                encoding="utf-8",
+            )
+
+            backend = self.CapturingBackend()
+            runner = AGENTIC.OpenDeepResearchTracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=2,
+                prompt_runtime_mode="segment_aware",
+                open_deep_research_path=repo_root,
+            )
+            result = runner.run_instance(AGENTIC.build_deep_research_demo_instance())
+            self.assertEqual(result["status"], "COMPLETED")
+            self.assertEqual(result["workload_source"], "open_deep_research")
+            self.assertEqual(
+                Path(result["open_deep_research_path"]),
+                repo_root.resolve(),
+            )
+            self.assertGreater(len(backend.calls), 0)
+            self.assertTrue(
+                any(
+                    "UPSTREAM_SUPERVISOR" in call.get("system_prompt", "")
+                    for call in backend.calls
+                )
+            )
+            self.assertTrue(
+                any(
+                    "UPSTREAM_RESEARCH" in call.get("system_prompt", "")
+                    for call in backend.calls
+                )
+            )
 
     @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
     def test_real_langgraph_runner_emits_router_and_reviewer_states(self):
