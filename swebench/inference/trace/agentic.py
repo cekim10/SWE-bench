@@ -3915,6 +3915,7 @@ class OpenDeepResearchTracedAgentRunner(DeepResearchTracedAgentRunner):
         iteration: int,
     ) -> str:
         return self._open_deep_research_prompts.final_report_generation_prompt.format(
+            date=self._open_deep_research_today(),
             research_brief=instance.problem_statement,
             messages=self._open_deep_research_messages(instance),
             findings=(
