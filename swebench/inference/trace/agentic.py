@@ -2466,6 +2466,26 @@ class LangGraphStyleTracedAgentRunner(TracedAgentRunner):
             + "\n".join(f"- {path}" for path in sorted(selected_files))
         )
 
+    def _router_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        iteration: int,
+        diagnostic_state_id: str | None,
+    ) -> str:
+        diagnostic_text = (
+            f"Previous failure context segment: {diagnostic_state_id}\n"
+            if diagnostic_state_id is not None
+            else ""
+        )
+        return (
+            f"Iteration: {iteration}\n"
+            "Route the issue using the already provided context segments.\n"
+            f"{diagnostic_text}"
+            "Candidate files:\n"
+            + "\n".join(f"- {path}" for path in sorted(selected_files))
+        )
+
     def _reviewer_system_prompt(self) -> str:
         return (
             "You are a review agent. Inspect the proposed patch, identify residual risks, "
@@ -2484,6 +2504,17 @@ class LangGraphStyleTracedAgentRunner(TracedAgentRunner):
             f"Issue:\n{instance.problem_statement}\n\n"
             f"Plan:\n{plan_text}\n\n"
             f"Patch under review:\n{patch_text}\n"
+        )
+
+    def _reviewer_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Iteration: {iteration}\n"
+            "Review the candidate patch using the provided context segments and decide "
+            "whether it is ready for verification."
         )
 
     def _reviewer_instruction_prompt(
@@ -3630,6 +3661,26 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             + "\n".join(f"- {path}" for path in sorted(selected_files))
         )
 
+    def _router_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        iteration: int,
+        diagnostic_state_id: str | None,
+    ) -> str:
+        diagnostic_text = (
+            f"Previous failure context segment: {diagnostic_state_id}\n"
+            if diagnostic_state_id is not None
+            else ""
+        )
+        return (
+            f"Iteration: {iteration}\n"
+            "Route the issue using the provided context segments.\n"
+            f"{diagnostic_text}"
+            "Candidate files:\n"
+            + "\n".join(f"- {path}" for path in sorted(selected_files))
+        )
+
     def _reviewer_system_prompt(self) -> str:
         return (
             "You are a review agent. Inspect the proposed patch, identify residual risks, "
@@ -3648,4 +3699,15 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             f"Issue:\n{instance.problem_statement}\n\n"
             f"Plan:\n{plan_text}\n\n"
             f"Patch under review:\n{patch_text}\n"
+        )
+
+    def _reviewer_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Iteration: {iteration}\n"
+            "Review the candidate patch using the provided context segments and decide "
+            "whether it is ready for verification."
         )
