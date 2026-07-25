@@ -364,15 +364,17 @@ class SegmentedGenerationRequest:
         user_parts = []
         base_system_prompt = fallback_system_prompt or self.fallback_system_prompt
         base_user_prompt = self.fallback_user_prompt
-        if base_user_prompt:
-            user_parts.append(base_user_prompt)
         for segment in self.request_segments or self.ordered_segments:
             if not segment.text:
                 continue
             if segment.role == SegmentRole.SYSTEM:
+                if base_system_prompt and segment.text.strip() == base_system_prompt.strip():
+                    continue
                 system_parts.append(segment.text)
             else:
                 user_parts.append(segment.text)
+        if base_user_prompt:
+            user_parts.append(base_user_prompt)
 
         messages: list[dict[str, str]] = []
         if system_parts:

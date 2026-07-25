@@ -622,6 +622,56 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 all(call.get("segment_request") is not None for call in backend.calls)
             )
 
+    def test_openhands_request_segment_selection_prefers_semantic_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "openhands"
+            codeact_dir = repo_root / "openhands" / "agenthub" / "codeact_agent"
+            codeact_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "config.template.toml").write_text(
+                '#default_agent = "CodeActAgent"\n',
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text("guide\n", encoding="utf-8")
+            (codeact_dir / "codeact_agent.py").write_text(
+                "class CodeActAgent:\n    pass\n",
+                encoding="utf-8",
+            )
+
+            runner = AGENTIC.OpenHandsTracedAgentRunner(
+                backend=AGENTIC.StubModelBackend(),
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=2,
+                prompt_runtime_mode="segment_aware",
+                openhands_path=repo_root,
+            )
+            reviewer_segments = [
+                {"state_id": "system_v1", "segment_role": "system"},
+                {"state_id": "task_v1", "segment_role": "task"},
+                {"state_id": "plan_v1", "segment_role": "plan"},
+                {"state_id": "patch_v1", "segment_role": "artifact"},
+                {"state_id": "review_v1", "segment_role": "review"},
+            ]
+            tester_segments = [
+                {"state_id": "system_v1", "segment_role": "system"},
+                {"state_id": "task_v1", "segment_role": "task"},
+                {"state_id": "patch_v1", "segment_role": "artifact"},
+                {"state_id": "review_v1", "segment_role": "review"},
+            ]
+
+            reviewer_request_ids = runner._request_segment_ids_for_step(
+                step_name="reviewer",
+                segments=reviewer_segments,
+            )
+            tester_request_ids = runner._request_segment_ids_for_step(
+                step_name="tester",
+                segments=tester_segments,
+            )
+
+            self.assertEqual(reviewer_request_ids, ["task_v1", "plan_v1", "patch_v1"])
+            self.assertEqual(tester_request_ids, ["task_v1", "patch_v1", "review_v1"])
+
     @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
     def test_real_langgraph_runner_emits_router_and_reviewer_states(self):
         with tempfile.TemporaryDirectory() as tmpdir:

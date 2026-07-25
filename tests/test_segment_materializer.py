@@ -256,6 +256,49 @@ class SegmentMaterializerTests(unittest.TestCase):
         self.assertEqual(snapshot.segment_states["plan-1"], ContextSegmentState.RESIDENT)
         self.assertGreaterEqual(snapshot.hbm_bytes, len("Plan v1".encode("utf-8")))
 
+    def test_segmented_generation_request_places_dynamic_user_prompt_last(self):
+        system = self.make_segment(
+            state_id="system-1",
+            logical_key="prompt/system",
+            module="system",
+            version=1,
+            text="You are a planner.",
+            role=SegmentRole.SYSTEM,
+            is_shared=True,
+            is_immutable=True,
+        )
+        task = self.make_segment(
+            state_id="task-1",
+            logical_key="prompt/task",
+            module="task",
+            version=1,
+            text="Fix bug #123.",
+            role=SegmentRole.TASK,
+        )
+        plan = self.make_segment(
+            state_id="plan-1",
+            logical_key="planner/plan",
+            module="plan",
+            version=1,
+            text="1. Inspect failing path.\n2. Patch logic.",
+            role=SegmentRole.PLAN,
+        )
+        request = RUNTIME.SegmentedGenerationRequest(
+            ordered_segments=(system, task, plan),
+            request_segments=(task, plan),
+            fallback_system_prompt=system.text,
+            fallback_user_prompt="Iteration: 2\nCurrent phase: coding",
+        )
+
+        messages = request.to_openai_messages()
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[0]["content"], "You are a planner.")
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertTrue(messages[1]["content"].startswith("Fix bug #123."))
+        self.assertIn("1. Inspect failing path.", messages[1]["content"])
+        self.assertTrue(messages[1]["content"].endswith("Current phase: coding"))
+
     def test_policy_offloads_ephemeral_inactive_hbm_segments(self):
         materializer = SegmentMaterializer(serving_adapter=SyntheticMaterializationAdapter())
         scratch = self.make_segment(

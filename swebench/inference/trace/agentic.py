@@ -1473,20 +1473,35 @@ class TracedAgentRunner:
         for segment in segments:
             state_id = str(segment["state_id"])
             role = str(segment.get("segment_role", "")).lower()
-            include = True
-            if role in {"system", "task"}:
-                include = False
-            elif step_name == "coder" and role in {"plan", "artifact"}:
-                include = False
-            elif step_name == "coder" and role == "evidence" and state_id.startswith("retrieval_"):
-                include = False
-            elif step_name == "reviewer" and role in {"plan", "artifact"}:
-                include = False
-            elif step_name == "tester" and role in {"plan", "artifact"}:
-                include = False
-            if include:
+            if self._should_include_request_segment(
+                step_name=step_name,
+                role=role,
+                state_id=state_id,
+                segment=segment,
+            ):
                 request_segment_ids.append(state_id)
         return request_segment_ids
+
+    def _should_include_request_segment(
+        self,
+        *,
+        step_name: str,
+        role: str,
+        state_id: str,
+        segment: Mapping[str, object],
+    ) -> bool:
+        include = True
+        if role in {"system", "task"}:
+            include = False
+        elif step_name == "coder" and role in {"plan", "artifact"}:
+            include = False
+        elif step_name == "coder" and role == "evidence" and state_id.startswith("retrieval_"):
+            include = False
+        elif step_name == "reviewer" and role in {"plan", "artifact"}:
+            include = False
+        elif step_name == "tester" and role in {"plan", "artifact"}:
+            include = False
+        return include
 
     def _prepare_monolithic_prompt(
         self,
@@ -3489,15 +3504,11 @@ class _OpenHandsPromptBackedMixin:
         iteration: int,
         diagnostic_state_id: str | None,
     ) -> str:
-        diagnostic_text = (
-            f"\n\nPrevious failure context:\n{diagnostic_state_id}"
-            if diagnostic_state_id is not None
-            else ""
-        )
         return (
-            f"{self._openhands_instance_context(instance, selected_files)}{diagnostic_text}\n\n"
             f"Iteration: {iteration}\n"
-            "Current phase: choose the next OpenHands repair route."
+            "Current phase: routing\n"
+            "Choose the next repair route using the task, evidence, and any prior "
+            "failure context provided in the semantic context."
         )
 
     def _router_instruction_prompt(
@@ -3508,14 +3519,9 @@ class _OpenHandsPromptBackedMixin:
         diagnostic_state_id: str | None,
     ) -> str:
         return (
-            f"{self._openhands_instance_context(instance, selected_files)}\n\n"
             f"Iteration: {iteration}\n"
-            + (
-                f"Previous failure context segment: {diagnostic_state_id}\n"
-                if diagnostic_state_id is not None
-                else ""
-            )
-            + "Use the provided context segments to choose the next OpenHands route."
+            "Current phase: routing\n"
+            "Use the provided semantic context to choose the next OpenHands route."
         )
 
     def _planner_system_prompt(self) -> str:
@@ -3528,15 +3534,11 @@ class _OpenHandsPromptBackedMixin:
         iteration: int,
         diagnostic_state_id: str | None,
     ) -> str:
-        diagnostic_text = (
-            f"\n\nPrevious failure context:\n{diagnostic_state_id}"
-            if diagnostic_state_id is not None
-            else ""
-        )
         return (
-            f"{self._openhands_instance_context(instance, selected_files)}{diagnostic_text}\n\n"
             f"Iteration: {iteration}\n"
-            "Current phase: produce the next concise CodeAct-style repair plan."
+            "Current phase: planning\n"
+            "Update the repair plan using the task, current route, evidence, and any "
+            "active diagnostic context provided in the semantic context."
         )
 
     def _coder_system_prompt(self) -> str:
@@ -3550,10 +3552,10 @@ class _OpenHandsPromptBackedMixin:
         iteration: int,
     ) -> str:
         return (
-            f"{self._openhands_instance_context(instance, selected_files)}\n\n"
             f"Iteration: {iteration}\n"
-            f"Plan:\n{plan_text}\n\n"
-            "Current phase: produce the minimal patch needed to advance the fix."
+            "Current phase: coding\n"
+            "Produce or revise the patch using the task, route, plan, evidence, and "
+            "current artifact provided in the semantic context."
         )
 
     def _coder_instruction_prompt(
@@ -3562,10 +3564,9 @@ class _OpenHandsPromptBackedMixin:
         iteration: int,
     ) -> str:
         return (
-            f"Issue:\n{instance.problem_statement}\n\n"
             f"Iteration: {iteration}\n"
-            "Use the active route, plan, and repository context segments to produce the next "
-            "OpenHands patch revision."
+            "Current phase: coding\n"
+            "Use the active semantic context to produce the next OpenHands patch revision."
         )
 
     def _reviewer_system_prompt(self) -> str:
@@ -3579,10 +3580,10 @@ class _OpenHandsPromptBackedMixin:
         iteration: int,
     ) -> str:
         return (
-            f"{self._openhands_instance_context(instance, {})}\n\n"
             f"Iteration: {iteration}\n"
-            f"Plan:\n{plan_text}\n\n"
-            f"Patch under review:\n{patch_text}\n"
+            "Current phase: review\n"
+            "Review the current artifact against the task and plan provided in the "
+            "semantic context."
         )
 
     def _reviewer_instruction_prompt(
@@ -3591,10 +3592,10 @@ class _OpenHandsPromptBackedMixin:
         iteration: int,
     ) -> str:
         return (
-            f"Issue:\n{instance.problem_statement}\n\n"
             f"Iteration: {iteration}\n"
-            "Review the candidate patch using the provided context segments and identify "
-            "remaining OpenHands-style execution risks before verification."
+            "Current phase: review\n"
+            "Review the candidate patch using the provided semantic context and identify "
+            "remaining OpenHands-style execution risks."
         )
 
     def _tester_system_prompt(self) -> str:
@@ -3611,12 +3612,10 @@ class _OpenHandsPromptBackedMixin:
         iteration: int,
     ) -> str:
         return (
-            f"{self._openhands_instance_context(instance, {})}\n\n"
             f"Iteration: {iteration}\n"
-            f"Plan:\n{plan_text}\n\n"
-            f"Patch:\n{patch_text}\n\n"
-            "Current phase: judge whether the patch resolves the issue and summarize the "
-            "verification outcome."
+            "Current phase: testing\n"
+            "Evaluate the current artifact using the task and prior review provided in "
+            "the semantic context."
         )
 
     def _tester_instruction_prompt(
@@ -3625,10 +3624,37 @@ class _OpenHandsPromptBackedMixin:
         iteration: int,
     ) -> str:
         return (
-            f"Issue:\n{instance.problem_statement}\n\n"
             f"Iteration: {iteration}\n"
-            "Use the active patch and review context segments to decide whether the issue is "
-            "resolved and what failure diagnostics should persist."
+            "Current phase: testing\n"
+            "Use the active semantic context to decide whether the issue is resolved and "
+            "what failure diagnostics should persist."
+        )
+
+    def _should_include_request_segment(
+        self,
+        *,
+        step_name: str,
+        role: str,
+        state_id: str,
+        segment: Mapping[str, object],
+    ) -> bool:
+        if role == "system":
+            return False
+        if step_name == "router":
+            return role in {"task", "evidence", "scratchpad"}
+        if step_name == "planner":
+            return role in {"task", "router", "evidence", "scratchpad"}
+        if step_name == "coder":
+            return role in {"task", "router", "plan", "evidence", "artifact"}
+        if step_name == "reviewer":
+            return role in {"task", "plan", "artifact"}
+        if step_name == "tester":
+            return role in {"task", "artifact", "review"}
+        return super()._should_include_request_segment(
+            step_name=step_name,
+            role=role,
+            state_id=state_id,
+            segment=segment,
         )
 
 
