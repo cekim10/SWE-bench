@@ -152,6 +152,8 @@ def build_matched_report(
     right_mismatch = right_report["aggregate"]["abstraction_mismatch"]
     left_bridge = left_report["aggregate"]["oracle_abstraction_bridge"]
     right_bridge = right_report["aggregate"]["oracle_abstraction_bridge"]
+    left_locality = left_report["aggregate"].get("reuse_locality")
+    right_locality = right_report["aggregate"].get("reuse_locality")
     left_runtime = left_report["aggregate"].get("runtime_behavior")
     right_runtime = right_report["aggregate"].get("runtime_behavior")
     left_latency = left_report["aggregate"].get("backend_latency")
@@ -174,6 +176,19 @@ def build_matched_report(
             - right_bridge["oracle_service_cost_savings_fraction"],
         },
     }
+    if left_locality is not None and right_locality is not None:
+        comparison["left_minus_right"].update(
+            {
+                "avg_accesses_per_segment": left_locality["avg_accesses_per_segment"]
+                - right_locality["avg_accesses_per_segment"],
+                "avg_revisits_per_segment": left_locality["avg_revisits_per_segment"]
+                - right_locality["avg_revisits_per_segment"],
+                "revisited_segment_fraction": left_locality["revisited_segment_fraction"]
+                - right_locality["revisited_segment_fraction"],
+                "avg_prompt_revisit_distance": left_locality["avg_prompt_revisit_distance"]
+                - right_locality["avg_prompt_revisit_distance"],
+            }
+        )
     if left_runtime is not None and right_runtime is not None:
         comparison["left_minus_right"].update(
             {
@@ -252,6 +267,8 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
     right_mismatch = right_agg["abstraction_mismatch"]
     left_bridge = left_agg["oracle_abstraction_bridge"]
     right_bridge = right_agg["oracle_abstraction_bridge"]
+    left_locality = left_agg.get("reuse_locality")
+    right_locality = right_agg.get("reuse_locality")
     left_runtime = left_agg.get("runtime_behavior")
     right_runtime = right_agg.get("runtime_behavior")
     left_latency = left_agg.get("backend_latency")
@@ -333,6 +350,28 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
             )
         else:
             lines.append(f"| {metric} | {left_value} | {right_value} | {delta} |")
+
+    if left_locality is not None and right_locality is not None:
+        locality_rows = [
+            ("Avg accesses / segment", left_locality["avg_accesses_per_segment"], right_locality["avg_accesses_per_segment"]),
+            ("Avg revisits / segment", left_locality["avg_revisits_per_segment"], right_locality["avg_revisits_per_segment"]),
+            ("Revisited segment fraction", left_locality["revisited_segment_fraction"], right_locality["revisited_segment_fraction"]),
+            ("Avg prompt revisit distance", left_locality["avg_prompt_revisit_distance"], right_locality["avg_prompt_revisit_distance"]),
+        ]
+        lines.extend(
+            [
+                "",
+                "## Reuse Locality",
+                "",
+                "| Metric | Left | Right | Left-Right |",
+                "| - | -: | -: | -: |",
+            ]
+        )
+        for metric, left_value, right_value in locality_rows:
+            delta = left_value - right_value
+            lines.append(
+                f"| {metric} | {left_value:.4f} | {right_value:.4f} | {delta:.4f} |"
+            )
 
     if left_runtime is not None and right_runtime is not None:
         runtime_rows = [

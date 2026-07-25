@@ -274,6 +274,10 @@ def analyze_trace_events(events: Sequence[Mapping[str, object]]) -> Dict[str, ob
         next_prompt_ts_by_key,
         trace_end_ts,
     )
+    reuse_locality = _reuse_locality_summary(
+        prompt_calls=prompt_call_list,
+        states=states,
+    )
     oracle_abstraction_bridge = _oracle_abstraction_bridge_summary(
         prompt_calls=prompt_call_list,
         states=states,
@@ -289,6 +293,7 @@ def analyze_trace_events(events: Sequence[Mapping[str, object]]) -> Dict[str, ob
         "lifecycle_characterization": lifecycle,
         "lifetime_correlation": lifetime_correlation,
         "abstraction_mismatch": mismatch,
+        "reuse_locality": reuse_locality,
         "oracle_abstraction_bridge": oracle_abstraction_bridge,
         "abstraction_bridge": _legacy_bridge_alias(oracle_abstraction_bridge),
     }
@@ -686,6 +691,12 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
             if (reused_tokens + materialized_tokens)
             else 0.0
         ),
+        "reuse_benefit_ratio": (
+            reused_tokens / (reused_tokens + materialized_tokens)
+            if (reused_tokens + materialized_tokens)
+            else 0.0
+        ),
+        "prompt_token_reuse_fraction": 0.0,
         "lifecycle_reclaims": sum(
             int(bucket["lifecycle_reclaims"]) for bucket in role_counts.values()
         ),
@@ -1088,6 +1099,32 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
         ]
     )
 
+    reuse_locality = aggregate.get("reuse_locality")
+    if reuse_locality is not None:
+        lines.extend(
+            [
+                "",
+                "## Reuse Locality",
+                "",
+                f"- Segments: {reuse_locality['segment_count']}",
+                f"- Avg accesses / segment: {reuse_locality['avg_accesses_per_segment']:.2f}",
+                f"- Avg revisits / segment: {reuse_locality['avg_revisits_per_segment']:.2f}",
+                f"- Revisited segment fraction: {reuse_locality['revisited_segment_fraction']:.2f}",
+                f"- Avg prompt revisit distance: {reuse_locality['avg_prompt_revisit_distance']:.2f}",
+                "",
+                "### By Module",
+                "",
+                "| Module | Count | Avg Accesses / Segment | Avg Revisits / Segment | Revisited Fraction | Avg Prompt Revisit Distance |",
+                "| - | -: | -: | -: | -: | -: |",
+            ]
+        )
+        for row in reuse_locality["module_rows"]:
+            lines.append(
+                f"| {row['module']} | {row['count']} | {row['avg_accesses_per_segment']:.2f} | "
+                f"{row['avg_revisits_per_segment']:.2f} | {row['revisited_segment_fraction']:.2f} | "
+                f"{row['avg_prompt_revisit_distance']:.2f} |"
+            )
+
     bridge = aggregate.get("oracle_abstraction_bridge", aggregate["abstraction_bridge"])
     lines.extend(
         [
@@ -1120,6 +1157,15 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
 
     runtime_behavior = aggregate.get("runtime_behavior")
     if runtime_behavior is not None:
+        reuse_benefit_ratio = float(
+            runtime_behavior.get(
+                "reuse_benefit_ratio",
+                runtime_behavior.get("token_weighted_reuse_rate", 0.0),
+            )
+        )
+        prompt_token_reuse_fraction = float(
+            runtime_behavior.get("prompt_token_reuse_fraction", 0.0)
+        )
         lines.extend(
             [
                 "",
@@ -1137,6 +1183,8 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Reused tokens: {runtime_behavior['reused_tokens']}",
                 f"- Materialized tokens: {runtime_behavior['materialized_tokens']}",
                 f"- Token-weighted reuse rate: {runtime_behavior['token_weighted_reuse_rate']:.2f}",
+                f"- Reuse benefit ratio: {reuse_benefit_ratio:.2f}",
+                f"- Prompt-token reuse fraction: {prompt_token_reuse_fraction:.2f}",
                 f"- Lifecycle reclaims: {runtime_behavior['lifecycle_reclaims']}",
                 f"- Policy reclaims: {runtime_behavior['policy_reclaims']}",
                 f"- Bytes reclaimed: {runtime_behavior['bytes_reclaimed']}",
@@ -1614,6 +1662,8 @@ def _empty_runtime_behavior_summary() -> Dict[str, object]:
         "materialized_tokens": 0,
         "rematerialized_tokens": 0,
         "token_weighted_reuse_rate": 0.0,
+        "reuse_benefit_ratio": 0.0,
+        "prompt_token_reuse_fraction": 0.0,
         "lifecycle_reclaims": 0,
         "policy_reclaims": 0,
         "bytes_reclaimed": 0,
@@ -1629,6 +1679,17 @@ def _empty_runtime_behavior_summary() -> Dict[str, object]:
         "lifetime_rows": [],
         "segment_rows": [],
         "execution_context_rows": [],
+    }
+
+
+def _empty_reuse_locality_summary() -> Dict[str, object]:
+    return {
+        "segment_count": 0,
+        "avg_accesses_per_segment": 0.0,
+        "avg_revisits_per_segment": 0.0,
+        "revisited_segment_fraction": 0.0,
+        "avg_prompt_revisit_distance": 0.0,
+        "module_rows": [],
     }
 
 
@@ -1964,6 +2025,12 @@ def _aggregate_runtime_behaviors(
             if (reused_tokens + materialized_tokens)
             else 0.0
         ),
+        "reuse_benefit_ratio": (
+            reused_tokens / (reused_tokens + materialized_tokens)
+            if (reused_tokens + materialized_tokens)
+            else 0.0
+        ),
+        "prompt_token_reuse_fraction": 0.0,
         "lifecycle_reclaims": sum(
             int(behavior["lifecycle_reclaims"]) for behavior in runtime_behaviors
         ),
@@ -2263,6 +2330,7 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
                 "avg_lifetime_spread": 0.0,
                 "lifetime_spread_per_prompt": [],
             },
+            "reuse_locality": _empty_reuse_locality_summary(),
             "runtime_behavior": _empty_runtime_behavior_summary(),
             "backend_latency": _empty_backend_latency_summary(),
             "oracle_abstraction_bridge": _empty_oracle_bridge_summary(),
@@ -2347,6 +2415,13 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
         / (mismatch["reusable_live_bytes"] + mismatch["stale_bytes_before_next_prompt"])
         if (mismatch["reusable_live_bytes"] + mismatch["stale_bytes_before_next_prompt"])
         else 0.0
+    )
+
+    reuse_locality = _aggregate_reuse_locality_summaries(
+        [
+            dict(analysis.get("reuse_locality", _empty_reuse_locality_summary()))
+            for analysis in analyses
+        ]
     )
 
     oracle_bridges = [_coerce_oracle_bridge(analysis) for analysis in analyses]
@@ -2466,6 +2541,15 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
             if "backend_latency" in analysis
         ]
     )
+    materialized = int(runtime_behavior.get("materialized_tokens", 0))
+    reused = int(runtime_behavior.get("reused_tokens", 0))
+    runtime_behavior["reuse_benefit_ratio"] = (
+        reused / (reused + materialized) if (reused + materialized) else 0.0
+    )
+    total_prompt_tokens = int(backend_latency.get("total_prompt_tokens", 0))
+    runtime_behavior["prompt_token_reuse_fraction"] = (
+        reused / total_prompt_tokens if total_prompt_tokens else 0.0
+    )
 
     return {
         "state_count": total_state_count,
@@ -2474,10 +2558,165 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
         "lifecycle_characterization": {"module_rows": module_lifecycle_rows},
         "lifetime_correlation": lifetime_correlation,
         "abstraction_mismatch": mismatch,
+        "reuse_locality": reuse_locality,
         "runtime_behavior": runtime_behavior,
         "backend_latency": backend_latency,
         "oracle_abstraction_bridge": oracle_abstraction_bridge,
         "abstraction_bridge": _legacy_bridge_alias(oracle_abstraction_bridge),
+    }
+
+
+def _reuse_locality_summary(
+    *,
+    prompt_calls: Sequence[PromptCall],
+    states: Mapping[str, StateRecord],
+) -> Dict[str, object]:
+    if not states:
+        return _empty_reuse_locality_summary()
+
+    prompt_index_by_prompt_id: Dict[str, int] = {}
+    for index, call in enumerate(
+        sorted(prompt_calls, key=lambda call: (call.ts, call.consumer, call.prompt_id))
+    ):
+        prompt_index_by_prompt_id.setdefault(call.prompt_id, index)
+    module_buckets: Dict[str, Dict[str, float | int | str | List[float]]] = {}
+
+    def ensure_bucket(module: str) -> Dict[str, float | int | str | List[float]]:
+        if module not in module_buckets:
+            module_buckets[module] = {
+                "module": module,
+                "count": 0,
+                "accesses_total": 0,
+                "revisits_total": 0,
+                "revisited_count": 0,
+                "prompt_revisit_distances": [],
+            }
+        return module_buckets[module]
+
+    all_access_counts: List[int] = []
+    all_revisit_counts: List[int] = []
+    all_prompt_revisit_distances: List[float] = []
+    revisited_segments = 0
+
+    for state in states.values():
+        access_count = len(state.read_prompt_ids)
+        revisit_count = max(0, access_count - 1)
+        all_access_counts.append(access_count)
+        all_revisit_counts.append(revisit_count)
+        if revisit_count > 0:
+            revisited_segments += 1
+
+        prompt_indices = []
+        seen_indices = set()
+        for prompt_id in state.read_prompt_ids:
+            prompt_index = prompt_index_by_prompt_id.get(prompt_id)
+            if prompt_index is None or prompt_index in seen_indices:
+                continue
+            seen_indices.add(prompt_index)
+            prompt_indices.append(prompt_index)
+        distances = [
+            float(prompt_indices[index] - prompt_indices[index - 1])
+            for index in range(1, len(prompt_indices))
+            if prompt_indices[index] > prompt_indices[index - 1]
+        ]
+        all_prompt_revisit_distances.extend(distances)
+
+        bucket = ensure_bucket(state.module)
+        bucket["count"] = int(bucket["count"]) + 1
+        bucket["accesses_total"] = int(bucket["accesses_total"]) + access_count
+        bucket["revisits_total"] = int(bucket["revisits_total"]) + revisit_count
+        if revisit_count > 0:
+            bucket["revisited_count"] = int(bucket["revisited_count"]) + 1
+        cast_distances = list(bucket["prompt_revisit_distances"])
+        cast_distances.extend(distances)
+        bucket["prompt_revisit_distances"] = cast_distances
+
+    module_rows = []
+    for module, bucket in sorted(module_buckets.items()):
+        count = int(bucket["count"])
+        accesses_total = int(bucket["accesses_total"])
+        revisits_total = int(bucket["revisits_total"])
+        revisited_count = int(bucket["revisited_count"])
+        distances = [float(value) for value in bucket["prompt_revisit_distances"]]
+        module_rows.append(
+            {
+                "module": module,
+                "count": count,
+                "avg_accesses_per_segment": accesses_total / count if count else 0.0,
+                "avg_revisits_per_segment": revisits_total / count if count else 0.0,
+                "revisited_segment_fraction": revisited_count / count if count else 0.0,
+                "avg_prompt_revisit_distance": (
+                    statistics.fmean(distances) if distances else 0.0
+                ),
+            }
+        )
+
+    segment_count = len(states)
+    return {
+        "segment_count": segment_count,
+        "avg_accesses_per_segment": (
+            statistics.fmean(all_access_counts) if all_access_counts else 0.0
+        ),
+        "avg_revisits_per_segment": (
+            statistics.fmean(all_revisit_counts) if all_revisit_counts else 0.0
+        ),
+        "revisited_segment_fraction": (
+            revisited_segments / segment_count if segment_count else 0.0
+        ),
+        "avg_prompt_revisit_distance": (
+            statistics.fmean(all_prompt_revisit_distances)
+            if all_prompt_revisit_distances
+            else 0.0
+        ),
+        "module_rows": module_rows,
+    }
+
+
+def _aggregate_reuse_locality_summaries(
+    reuse_localities: Sequence[Mapping[str, object]],
+) -> Dict[str, object]:
+    if not reuse_localities:
+        return _empty_reuse_locality_summary()
+
+    module_rows = _average_rows(
+        [locality.get("module_rows", []) for locality in reuse_localities],
+        [
+            "avg_accesses_per_segment",
+            "avg_revisits_per_segment",
+            "revisited_segment_fraction",
+            "avg_prompt_revisit_distance",
+        ],
+        count_field="count",
+    )
+    segment_count = sum(int(locality.get("segment_count", 0)) for locality in reuse_localities)
+    accesses_weighted = sum(
+        float(locality.get("avg_accesses_per_segment", 0.0)) * int(locality.get("segment_count", 0))
+        for locality in reuse_localities
+    )
+    revisits_weighted = sum(
+        float(locality.get("avg_revisits_per_segment", 0.0)) * int(locality.get("segment_count", 0))
+        for locality in reuse_localities
+    )
+    revisited_fraction_weighted = sum(
+        float(locality.get("revisited_segment_fraction", 0.0)) * int(locality.get("segment_count", 0))
+        for locality in reuse_localities
+    )
+    distances = [
+        float(locality.get("avg_prompt_revisit_distance", 0.0))
+        for locality in reuse_localities
+        if float(locality.get("avg_prompt_revisit_distance", 0.0)) > 0.0
+    ]
+    return {
+        "segment_count": segment_count,
+        "avg_accesses_per_segment": accesses_weighted / segment_count if segment_count else 0.0,
+        "avg_revisits_per_segment": revisits_weighted / segment_count if segment_count else 0.0,
+        "revisited_segment_fraction": (
+            revisited_fraction_weighted / segment_count if segment_count else 0.0
+        ),
+        "avg_prompt_revisit_distance": (
+            statistics.fmean(distances) if distances else 0.0
+        ),
+        "module_rows": module_rows,
     }
 
 
