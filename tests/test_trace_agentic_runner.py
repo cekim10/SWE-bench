@@ -653,6 +653,23 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 {"state_id": "patch_v1", "segment_role": "artifact"},
                 {"state_id": "review_v1", "segment_role": "review"},
             ]
+            planner_segments = [
+                {"state_id": "system_v1", "segment_role": "system"},
+                {"state_id": "task_v1", "segment_role": "task"},
+                {"state_id": "route_v1", "segment_role": "router"},
+                {"state_id": "readme_1", "segment_role": "evidence"},
+                {"state_id": "retrieval_1", "segment_role": "evidence"},
+                {"state_id": "retrieval_2", "segment_role": "evidence"},
+            ]
+            coder_segments = [
+                {"state_id": "system_v1", "segment_role": "system"},
+                {"state_id": "task_v1", "segment_role": "task"},
+                {"state_id": "route_v1", "segment_role": "router"},
+                {"state_id": "plan_v1", "segment_role": "plan"},
+                {"state_id": "readme_1", "segment_role": "evidence"},
+                {"state_id": "retrieval_1", "segment_role": "evidence"},
+                {"state_id": "patch_v1", "segment_role": "artifact"},
+            ]
             tester_segments = [
                 {"state_id": "system_v1", "segment_role": "system"},
                 {"state_id": "task_v1", "segment_role": "task"},
@@ -660,6 +677,14 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 {"state_id": "review_v1", "segment_role": "review"},
             ]
 
+            planner_request_ids = runner._request_segment_ids_for_step(
+                step_name="planner",
+                segments=planner_segments,
+            )
+            coder_request_ids = runner._request_segment_ids_for_step(
+                step_name="coder",
+                segments=coder_segments,
+            )
             reviewer_request_ids = runner._request_segment_ids_for_step(
                 step_name="reviewer",
                 segments=reviewer_segments,
@@ -669,6 +694,14 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 segments=tester_segments,
             )
 
+            self.assertEqual(
+                planner_request_ids,
+                ["task_v1", "route_v1", "readme_1", "retrieval_1"],
+            )
+            self.assertEqual(
+                coder_request_ids,
+                ["task_v1", "plan_v1", "readme_1"],
+            )
             self.assertEqual(reviewer_request_ids, ["task_v1", "plan_v1", "patch_v1"])
             self.assertEqual(tester_request_ids, ["task_v1", "patch_v1", "review_v1"])
 

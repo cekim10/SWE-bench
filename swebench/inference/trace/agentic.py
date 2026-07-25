@@ -3630,32 +3630,58 @@ class _OpenHandsPromptBackedMixin:
             "what failure diagnostics should persist."
         )
 
-    def _should_include_request_segment(
+    def _request_segment_ids_for_step(
         self,
         *,
         step_name: str,
-        role: str,
-        state_id: str,
-        segment: Mapping[str, object],
-    ) -> bool:
-        if role == "system":
-            return False
-        if step_name == "router":
-            return role in {"task", "evidence", "scratchpad"}
-        if step_name == "planner":
-            return role in {"task", "router", "evidence", "scratchpad"}
-        if step_name == "coder":
-            return role in {"task", "router", "plan", "evidence", "artifact"}
-        if step_name == "reviewer":
-            return role in {"task", "plan", "artifact"}
-        if step_name == "tester":
-            return role in {"task", "artifact", "review"}
-        return super()._should_include_request_segment(
-            step_name=step_name,
-            role=role,
-            state_id=state_id,
-            segment=segment,
-        )
+        segments: Sequence[Mapping[str, object]],
+    ) -> List[str]:
+        request_segment_ids: List[str] = []
+        evidence_budget_by_step = {
+            "router": 1,
+            "planner": 2,
+            "coder": 1,
+            "reviewer": 0,
+            "tester": 0,
+        }
+        evidence_budget = evidence_budget_by_step.get(step_name, 0)
+        evidence_count = 0
+
+        for segment in segments:
+            state_id = str(segment["state_id"])
+            role = str(segment.get("segment_role", "")).lower()
+
+            include = False
+            if role == "system":
+                include = False
+            elif step_name == "router":
+                include = role in {"task", "scratchpad"}
+            elif step_name == "planner":
+                include = role in {"task", "router", "scratchpad"}
+            elif step_name == "coder":
+                include = role in {"task", "plan"}
+            elif step_name == "reviewer":
+                include = role in {"task", "plan", "artifact"}
+            elif step_name == "tester":
+                include = role in {"task", "artifact", "review"}
+            else:
+                include = super()._should_include_request_segment(
+                    step_name=step_name,
+                    role=role,
+                    state_id=state_id,
+                    segment=segment,
+                )
+
+            if role == "evidence":
+                if evidence_count < evidence_budget:
+                    include = True
+                    evidence_count += 1
+                else:
+                    include = False
+
+            if include:
+                request_segment_ids.append(state_id)
+        return request_segment_ids
 
 
 class SyntheticStressTracedAgentRunner(TracedAgentRunner):
