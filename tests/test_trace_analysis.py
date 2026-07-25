@@ -57,6 +57,144 @@ ANALYSIS = MODULES["swebench.inference.trace.analysis"]
 
 
 class TraceAnalysisTests(unittest.TestCase):
+    def test_monolithic_prompt_reads_preserve_lifecycle_mismatch(self):
+        events = [
+            {
+                "ts": 0,
+                "op": "CREATE",
+                "workflow_id": "wf",
+                "tenant_id": "tenant",
+                "state_id": "system_v1",
+                "logical_key": "prompt/system",
+                "state_type": "agent_anchor",
+                "size_bytes": 100,
+                "token_count": 10,
+                "producer": "runner",
+                "owner_scope": "workflow",
+                "version": 1,
+                "recompute_cost": 1.0,
+                "reload_cost": 1.0,
+            },
+            {
+                "ts": 1,
+                "op": "CREATE",
+                "workflow_id": "wf",
+                "tenant_id": "tenant",
+                "state_id": "plan_v1",
+                "logical_key": "plan/current",
+                "state_type": "plan",
+                "size_bytes": 80,
+                "token_count": 8,
+                "producer": "planner",
+                "owner_scope": "workflow",
+                "version": 1,
+                "recompute_cost": 1.0,
+                "reload_cost": 1.0,
+            },
+            {
+                "ts": 2,
+                "op": "READ",
+                "workflow_id": "wf",
+                "tenant_id": "tenant",
+                "state_id": "system_v1",
+                "consumer": "coder",
+                "metadata": {
+                    "hook": "coder.messages_for_llm",
+                    "prompt_id": "coder-1",
+                    "runtime_prompt_mode": "monolithic",
+                    "runtime_monolithic_state_id": "mono_coder_v1",
+                    "context_module": "system",
+                },
+            },
+            {
+                "ts": 3,
+                "op": "READ",
+                "workflow_id": "wf",
+                "tenant_id": "tenant",
+                "state_id": "plan_v1",
+                "consumer": "coder",
+                "metadata": {
+                    "hook": "coder.messages_for_llm",
+                    "prompt_id": "coder-1",
+                    "runtime_prompt_mode": "monolithic",
+                    "runtime_monolithic_state_id": "mono_coder_v1",
+                    "context_module": "plan",
+                },
+            },
+            {
+                "ts": 4,
+                "op": "CREATE",
+                "workflow_id": "wf",
+                "tenant_id": "tenant",
+                "state_id": "artifact_v1",
+                "logical_key": "patch/current",
+                "state_type": "generated_artifact",
+                "size_bytes": 120,
+                "token_count": 12,
+                "producer": "coder",
+                "owner_scope": "workflow",
+                "version": 1,
+                "recompute_cost": 1.0,
+                "reload_cost": 1.0,
+            },
+            {
+                "ts": 5,
+                "op": "RELEASE",
+                "workflow_id": "wf",
+                "tenant_id": "tenant",
+                "state_id": "plan_v1",
+                "consumer": "planner",
+                "metadata": {"reason": "replan"},
+            },
+            {
+                "ts": 6,
+                "op": "READ",
+                "workflow_id": "wf",
+                "tenant_id": "tenant",
+                "state_id": "system_v1",
+                "consumer": "tester",
+                "metadata": {
+                    "hook": "tester.messages_for_llm",
+                    "prompt_id": "tester-1",
+                    "runtime_prompt_mode": "monolithic",
+                    "runtime_monolithic_state_id": "mono_tester_v1",
+                    "context_module": "system",
+                },
+            },
+            {
+                "ts": 7,
+                "op": "READ",
+                "workflow_id": "wf",
+                "tenant_id": "tenant",
+                "state_id": "artifact_v1",
+                "consumer": "tester",
+                "metadata": {
+                    "hook": "tester.messages_for_llm",
+                    "prompt_id": "tester-1",
+                    "runtime_prompt_mode": "monolithic",
+                    "runtime_monolithic_state_id": "mono_tester_v1",
+                    "context_module": "artifact",
+                },
+            },
+        ]
+
+        analysis = ANALYSIS.analyze_trace_events(events)
+        mismatch = analysis["abstraction_mismatch"]
+        lifecycle = analysis["lifecycle_characterization"]
+
+        self.assertEqual(mismatch["evaluable_prompt_count"], 1)
+        self.assertEqual(mismatch["monolithic_invalidation_events"], 1)
+        self.assertGreater(mismatch["mixed_lifecycle_prompt_rate"], 0.0)
+        self.assertGreater(mismatch["pinned_live_fraction"], 0.0)
+        self.assertEqual(
+            lifecycle["mixed_lifecycle_prompt_rate"],
+            mismatch["mixed_lifecycle_prompt_rate"],
+        )
+        self.assertEqual(
+            lifecycle["avg_prompt_lifetime_spread"],
+            mismatch["avg_lifetime_spread"],
+        )
+
     def test_stub_trace_analysis_reports_modules_and_mismatch(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_event_path = Path(tmpdir) / "runtime.jsonl"
@@ -485,3 +623,15 @@ class TraceAnalysisTests(unittest.TestCase):
             )
             discovered = ANALYSIS.discover_trace_paths(run_output_path=output_path)
             self.assertEqual(discovered, [trace_path.resolve()])
+
+    def test_discover_trace_paths_ignores_auxiliary_jsonl_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_dir = Path(tmpdir)
+            primary = trace_dir / "trace.jsonl"
+            backend = trace_dir / "trace_backend_calls.jsonl"
+            runtime = trace_dir / "trace_runtime_events.jsonl"
+            for path in [primary, backend, runtime]:
+                path.write_text('{"ts":0,"op":"READ"}\n', encoding="utf-8")
+
+            discovered = ANALYSIS.discover_trace_paths(trace_dir=trace_dir)
+            self.assertEqual(discovered, [primary.resolve()])

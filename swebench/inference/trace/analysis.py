@@ -153,16 +153,33 @@ def discover_trace_paths(
     trace_paths: Sequence[str] | None = None,
     run_output_path: str | Path | None = None,
 ) -> List[Path]:
+    def is_primary_semantic_trace(path: Path) -> bool:
+        name = path.name
+        return not (
+            name.endswith("_backend_calls.jsonl")
+            or name.endswith("_runtime_events.jsonl")
+        )
+
     discovered: List[Path] = []
     if trace_dir is not None:
-        discovered.extend(sorted(Path(trace_dir).glob("*.jsonl")))
+        discovered.extend(
+            path
+            for path in sorted(Path(trace_dir).glob("*.jsonl"))
+            if is_primary_semantic_trace(path)
+        )
     if trace_paths is not None:
-        discovered.extend(Path(path) for path in trace_paths)
+        discovered.extend(
+            path
+            for path in (Path(path) for path in trace_paths)
+            if is_primary_semantic_trace(path)
+        )
     if run_output_path is not None:
         for record in load_run_output_records(run_output_path):
             trace_path = record.get("trace_path")
             if trace_path:
-                discovered.append(Path(str(trace_path)))
+                candidate = Path(str(trace_path))
+                if is_primary_semantic_trace(candidate):
+                    discovered.append(candidate)
     deduped = []
     seen = set()
     for path in discovered:
@@ -250,12 +267,16 @@ def analyze_trace_events(events: Sequence[Mapping[str, object]]) -> Dict[str, ob
     )
     next_prompt_ts_by_key: Dict[tuple[str, str, str], int | None] = {}
     next_prompt_call_by_key: Dict[tuple[str, str, str], PromptCall | None] = {}
-    calls_by_consumer: Dict[str, List[PromptCall]] = defaultdict(list)
+    calls_by_workflow: Dict[str, List[PromptCall]] = defaultdict(list)
     for call in prompt_call_list:
-        calls_by_consumer[call.consumer].append(call)
-    for consumer_calls in calls_by_consumer.values():
-        for index, call in enumerate(consumer_calls):
-            next_call = consumer_calls[index + 1] if index + 1 < len(consumer_calls) else None
+        calls_by_workflow[call.workflow_id].append(call)
+    for workflow_calls in calls_by_workflow.values():
+        ordered_calls = sorted(
+            workflow_calls,
+            key=lambda call: (call.ts, call.consumer, call.prompt_id),
+        )
+        for index, call in enumerate(ordered_calls):
+            next_call = ordered_calls[index + 1] if index + 1 < len(ordered_calls) else None
             next_prompt_ts_by_key[(call.workflow_id, call.consumer, call.prompt_id)] = (
                 next_call.ts if next_call is not None else None
             )
@@ -272,8 +293,15 @@ def analyze_trace_events(events: Sequence[Mapping[str, object]]) -> Dict[str, ob
         prompt_call_list,
         states,
         next_prompt_ts_by_key,
+        next_prompt_call_by_key,
         trace_end_ts,
     )
+    lifecycle = {
+        **dict(lifecycle),
+        "mixed_lifecycle_prompt_rate": mismatch["mixed_lifecycle_prompt_rate"],
+        "avg_prompt_lifetime_spread": mismatch["avg_lifetime_spread"],
+        "lifetime_spread_per_prompt": mismatch["lifetime_spread_per_prompt"],
+    }
     reuse_locality = _reuse_locality_summary(
         prompt_calls=prompt_call_list,
         states=states,
@@ -1386,6 +1414,7 @@ def _mismatch_summary(
     prompt_calls: Sequence[PromptCall],
     states: Mapping[str, StateRecord],
     next_prompt_ts_by_key: Mapping[tuple[str, str, str], int | None],
+    next_prompt_call_by_key: Mapping[tuple[str, str, str], PromptCall | None],
     trace_end_ts: int,
 ) -> Dict[str, object]:
     mixed_prompts = 0
@@ -1399,8 +1428,11 @@ def _mismatch_summary(
         next_prompt_ts = next_prompt_ts_by_key.get(
             (call.workflow_id, call.consumer, call.prompt_id)
         )
+        next_call = next_prompt_call_by_key.get(
+            (call.workflow_id, call.consumer, call.prompt_id)
+        )
         remaining_lifetimes = []
-        if next_prompt_ts is None:
+        if next_prompt_ts is None or next_call is None:
             for state_id in call.state_ids:
                 record = states[state_id]
                 remaining_lifetimes.append(max(0, record.end_ts(trace_end_ts) - call.ts))
@@ -1411,14 +1443,19 @@ def _mismatch_summary(
         evaluable_prompts += 1
         stale_states = []
         live_states = []
+        next_state_ids = {
+            state_id for state_id in next_call.state_ids if state_id in states
+        }
         for state_id in call.state_ids:
             record = states[state_id]
             end_ts = record.end_ts(trace_end_ts)
             remaining_lifetimes.append(max(0, end_ts - call.ts))
-            if end_ts < next_prompt_ts:
+            if state_id in next_state_ids:
+                live_states.append(record)
+            elif end_ts <= next_prompt_ts:
                 stale_states.append(record)
             else:
-                live_states.append(record)
+                stale_states.append(record)
         if remaining_lifetimes:
             lifetime_spreads.append(max(remaining_lifetimes) - min(remaining_lifetimes))
         total_live_bytes_in_evaluable_prompts += sum(
@@ -1521,7 +1558,7 @@ def _oracle_abstraction_bridge_summary(
         stale_live_states = []
         for state_id in current_ids:
             record = states[state_id]
-            if record.end_ts(trace_end_ts) >= next_prompt_ts:
+            if record.end_ts(trace_end_ts) > next_prompt_ts:
                 live_states.append(record)
                 if state_id not in next_set:
                     stale_live_states.append(record)
@@ -2555,7 +2592,14 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
         "state_count": total_state_count,
         "prompt_call_count": total_prompt_calls,
         "prompt_composition": {"module_rows": module_prompt_rows},
-        "lifecycle_characterization": {"module_rows": module_lifecycle_rows},
+        "lifecycle_characterization": {
+            "module_rows": module_lifecycle_rows,
+            # Compatibility aliases for consumers that expect prompt-level
+            # lifecycle characterization alongside module summaries.
+            "mixed_lifecycle_prompt_rate": mismatch["mixed_lifecycle_prompt_rate"],
+            "avg_prompt_lifetime_spread": mismatch["avg_lifetime_spread"],
+            "lifetime_spread_per_prompt": mismatch["lifetime_spread_per_prompt"],
+        },
         "lifetime_correlation": lifetime_correlation,
         "abstraction_mismatch": mismatch,
         "reuse_locality": reuse_locality,
