@@ -24,7 +24,7 @@ class VLLMBackendRequest:
     def to_messages(self) -> list[dict[str, str]]:
         if self.messages_override is not None:
             return [{"role": role, "content": content} for role, content in self.messages_override]
-        if self.prompt_mode == "segment_aware" and self.segment_request is not None:
+        if self.segment_request is not None:
             return self.segment_request.to_openai_messages(
                 fallback_system_prompt=self.system_prompt
             )

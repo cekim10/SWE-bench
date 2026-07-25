@@ -405,7 +405,7 @@ class StubModelBackend:
         message_build_started_at = time.perf_counter()
         messages = (
             segment_request.to_openai_messages(fallback_system_prompt=system_prompt)
-            if prompt_mode == "segment_aware" and segment_request is not None
+            if segment_request is not None
             else [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -644,10 +644,14 @@ class OpenAICompatibleChatBackend:
         materializer_snapshot: RuntimeResidencySnapshot | None = None,
     ) -> str:
         client, mode = self._client()
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
+        messages = (
+            segment_request.to_openai_messages(fallback_system_prompt=system_prompt)
+            if segment_request is not None
+            else [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
         if mode == "client":
             response = client.chat.completions.create(
                 model=self.model,
@@ -1173,6 +1177,7 @@ class TracedAgentRunner:
     def _reset_monolithic_prompt_runtime_state(self) -> None:
         self._monolithic_prompt_versions_by_consumer: Dict[str, int] = {}
         self._monolithic_prompt_current_by_consumer: Dict[str, Dict[str, object]] = {}
+        self._runtime_segment_cache: Dict[str, ContextSegment] = {}
 
     def _tier_from_materialization(self, materialization: str | None) -> ResidencyTier | None:
         if materialization == "HBM":
@@ -1198,8 +1203,6 @@ class TracedAgentRunner:
         is_ephemeral: bool,
         metadata: Mapping[str, object] | None = None,
     ) -> None:
-        if self.prompt_runtime_mode != "segment_aware":
-            return
         segment = ContextSegment(
             state_id=handle.state_id,
             identity=SegmentIdentity(logical_key=handle.logical_key, module=module),
@@ -1216,6 +1219,9 @@ class TracedAgentRunner:
             metadata={"role": role, **dict(metadata or {})},
             residency_hint=self._tier_from_materialization(materialization),
         )
+        self._runtime_segment_cache[segment.state_id] = segment
+        if self.prompt_runtime_mode != "segment_aware":
+            return
         materializer.register_segment(segment)
 
     def _release_runtime_segment(
@@ -1267,8 +1273,13 @@ class TracedAgentRunner:
         system_prompt: str,
         user_prompt: str,
         segments: Sequence[Mapping[str, object]],
+        request_segment_ids: Sequence[str] | None = None,
         metadata: Mapping[str, object] | None = None,
-    ) -> tuple[ContextSegmentGroup, RuntimeResidencySnapshot]:
+    ) -> tuple[
+        ContextSegmentGroup,
+        SegmentedGenerationRequest,
+        RuntimeResidencySnapshot,
+    ]:
         prompt_messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -1346,6 +1357,17 @@ class TracedAgentRunner:
             ),
         )
         snapshot = materializer.snapshot()
+        flattened_ordered_segments = tuple(
+            self._runtime_segment_cache[str(segment["state_id"])] for segment in segments
+        )
+        flattened_request_segments = tuple(
+            self._runtime_segment_cache[state_id]
+            for state_id in (
+                tuple(request_segment_ids)
+                if request_segment_ids is not None
+                else tuple(str(segment["state_id"]) for segment in segments)
+            )
+        )
         trace.log_prompt_segments(
             consumer=consumer,
             prompt_id=prompt_id,
@@ -1361,7 +1383,17 @@ class TracedAgentRunner:
                 "runtime_monolithic_state_id": state_id,
             },
         )
-        return group, snapshot
+        return (
+            group,
+            SegmentedGenerationRequest(
+                ordered_segments=flattened_ordered_segments,
+                request_segments=flattened_request_segments,
+                fallback_system_prompt=system_prompt,
+                fallback_user_prompt=user_prompt,
+                enable_prefix_caching=False,
+            ),
+            snapshot,
+        )
 
     def _release_monolithic_prompt_runtime(
         self,
@@ -1468,7 +1500,11 @@ class TracedAgentRunner:
             )
             return "segment_aware", group, request, snapshot
 
-        group, snapshot = self._prepare_monolithic_prompt(
+        request_segment_ids = self._request_segment_ids_for_step(
+            step_name=step_name,
+            segments=segments,
+        )
+        group, request, snapshot = self._prepare_monolithic_prompt(
             materializer=materializer,
             trace=trace,
             workflow_id=workflow_id,
@@ -1478,9 +1514,10 @@ class TracedAgentRunner:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             segments=segments,
+            request_segment_ids=request_segment_ids,
             metadata=metadata,
         )
-        return "monolithic", group, None, snapshot
+        return "monolithic", group, request, snapshot
 
     def _runtime_event_summary(self, materializer: SegmentRuntime) -> Dict[str, object]:
         events = materializer.events()

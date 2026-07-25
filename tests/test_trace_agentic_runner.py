@@ -301,6 +301,50 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 )
             )
 
+    def test_open_deep_research_monolithic_flattens_active_context_for_backend(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "open_deep_research"
+            prompts_dir = repo_root / "src" / "open_deep_research"
+            prompts_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "langgraph.json").write_text(
+                '{"graphs": {"Deep Researcher": "./src/open_deep_research/deep_researcher.py:deep_researcher"}}',
+                encoding="utf-8",
+            )
+            (prompts_dir / "prompts.py").write_text(
+                dedent(
+                    '''
+                    clarify_with_user_instructions = "clarify {messages} {date}"
+                    transform_messages_into_research_topic_prompt = "brief {messages} {date}"
+                    lead_researcher_prompt = "UPSTREAM_SUPERVISOR {date} {max_concurrent_research_units} {max_researcher_iterations}"
+                    research_system_prompt = "UPSTREAM_RESEARCH {mcp_prompt} {date}"
+                    compress_research_system_prompt = "UPSTREAM_COMPRESS {date}"
+                    compress_research_simple_human_message = "UPSTREAM_CLEANUP"
+                    final_report_generation_prompt = "UPSTREAM_FINAL {research_brief} {messages} {findings} {date}"
+                    '''
+                ),
+                encoding="utf-8",
+            )
+
+            backend = self.CapturingBackend()
+            runner = AGENTIC.OpenDeepResearchTracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=2,
+                prompt_runtime_mode="monolithic",
+                open_deep_research_path=repo_root,
+            )
+            result = runner.run_instance(AGENTIC.build_deep_research_demo_instance())
+            self.assertEqual(result["status"], "COMPLETED")
+            self.assertGreater(len(backend.calls), 0)
+            self.assertTrue(
+                all(call.get("prompt_mode") == "monolithic" for call in backend.calls)
+            )
+            self.assertTrue(
+                all(call.get("segment_request") is not None for call in backend.calls)
+            )
+
     @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
     def test_real_langgraph_runner_emits_router_and_reviewer_states(self):
         with tempfile.TemporaryDirectory() as tmpdir:
