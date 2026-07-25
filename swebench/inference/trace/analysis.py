@@ -804,6 +804,46 @@ def analyze_backend_call_records(
     total_duplicate_prompt_tokens_estimate = sum(
         int(record.get("duplicate_prompt_tokens_estimate") or 0) for record in records
     )
+    total_request_segment_serialized_tokens_estimate = sum(
+        int(record.get("request_segment_serialized_tokens_estimate") or 0)
+        for record in records
+    )
+    total_request_segment_overlap_tokens_estimate = sum(
+        int(record.get("request_segment_overlap_tokens_estimate") or 0)
+        for record in records
+    )
+    total_request_segment_exact_duplicate_count = sum(
+        int(record.get("request_segment_exact_duplicate_count") or 0)
+        for record in records
+    )
+    segment_role_buckets: Dict[str, Dict[str, object]] = {}
+    for record in records:
+        for row in record.get("request_segment_rows", []) or []:
+            role = str(row.get("role", "unknown"))
+            bucket = segment_role_buckets.setdefault(
+                role,
+                {
+                    "role": role,
+                    "segment_occurrences": 0,
+                    "raw_token_count": 0,
+                    "serialized_token_count": 0,
+                    "overlap_token_estimate": 0,
+                    "exact_duplicate_count": 0,
+                },
+            )
+            bucket["segment_occurrences"] = int(bucket["segment_occurrences"]) + 1
+            bucket["raw_token_count"] = int(bucket["raw_token_count"]) + int(
+                row.get("raw_token_count", 0)
+            )
+            bucket["serialized_token_count"] = int(
+                bucket["serialized_token_count"]
+            ) + int(row.get("serialized_token_count", 0))
+            bucket["overlap_token_estimate"] = int(
+                bucket["overlap_token_estimate"]
+            ) + int(row.get("overlap_token_estimate", 0))
+            bucket["exact_duplicate_count"] = int(
+                bucket["exact_duplicate_count"]
+            ) + int(bool(row.get("exact_duplicate", False)))
     grouped: Dict[tuple[str, str], List[Mapping[str, object]]] = defaultdict(list)
     for record in records:
         grouped[
@@ -865,6 +905,18 @@ def analyze_backend_call_records(
         step_duplicate_prompt_tokens_estimate = sum(
             int(record.get("duplicate_prompt_tokens_estimate") or 0) for record in step_records
         )
+        step_request_segment_serialized_tokens_estimate = sum(
+            int(record.get("request_segment_serialized_tokens_estimate") or 0)
+            for record in step_records
+        )
+        step_request_segment_overlap_tokens_estimate = sum(
+            int(record.get("request_segment_overlap_tokens_estimate") or 0)
+            for record in step_records
+        )
+        step_request_segment_exact_duplicate_count = sum(
+            int(record.get("request_segment_exact_duplicate_count") or 0)
+            for record in step_records
+        )
         step_rows.append(
             {
                 "step_name": step_name,
@@ -905,6 +957,21 @@ def analyze_backend_call_records(
                 "assembled_prompt_tokens_estimate": step_assembled_prompt_tokens_estimate,
                 "prompt_payload_tokens_estimate": step_prompt_payload_tokens_estimate,
                 "duplicate_prompt_tokens_estimate": step_duplicate_prompt_tokens_estimate,
+                "request_segment_serialized_tokens_estimate": (
+                    step_request_segment_serialized_tokens_estimate
+                ),
+                "request_segment_overlap_tokens_estimate": (
+                    step_request_segment_overlap_tokens_estimate
+                ),
+                "request_segment_overlap_ratio": (
+                    step_request_segment_overlap_tokens_estimate
+                    / step_request_segment_serialized_tokens_estimate
+                    if step_request_segment_serialized_tokens_estimate
+                    else 0.0
+                ),
+                "request_segment_exact_duplicate_count": (
+                    step_request_segment_exact_duplicate_count
+                ),
             }
         )
 
@@ -938,6 +1005,33 @@ def analyze_backend_call_records(
         "total_assembled_prompt_tokens_estimate": total_assembled_prompt_tokens_estimate,
         "total_prompt_payload_tokens_estimate": total_prompt_payload_tokens_estimate,
         "total_duplicate_prompt_tokens_estimate": total_duplicate_prompt_tokens_estimate,
+        "total_request_segment_serialized_tokens_estimate": (
+            total_request_segment_serialized_tokens_estimate
+        ),
+        "total_request_segment_overlap_tokens_estimate": (
+            total_request_segment_overlap_tokens_estimate
+        ),
+        "request_segment_overlap_ratio": (
+            total_request_segment_overlap_tokens_estimate
+            / total_request_segment_serialized_tokens_estimate
+            if total_request_segment_serialized_tokens_estimate
+            else 0.0
+        ),
+        "total_request_segment_exact_duplicate_count": (
+            total_request_segment_exact_duplicate_count
+        ),
+        "segment_role_rows": [
+            {
+                **bucket,
+                "overlap_ratio": (
+                    int(bucket["overlap_token_estimate"])
+                    / int(bucket["serialized_token_count"])
+                    if int(bucket["serialized_token_count"])
+                    else 0.0
+                ),
+            }
+            for _, bucket in sorted(segment_role_buckets.items())
+        ],
         "step_rows": step_rows,
     }
 
@@ -1273,11 +1367,15 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Assembled prompt tokens (est.): {backend_latency['total_assembled_prompt_tokens_estimate']}",
                 f"- Prompt payload tokens (est.): {backend_latency['total_prompt_payload_tokens_estimate']}",
                 f"- Duplicate prompt tokens (est.): {backend_latency['total_duplicate_prompt_tokens_estimate']}",
+                f"- Serialized request-segment tokens (est.): {backend_latency['total_request_segment_serialized_tokens_estimate']}",
+                f"- Request-segment overlap tokens (est.): {backend_latency['total_request_segment_overlap_tokens_estimate']}",
+                f"- Request-segment overlap ratio: {backend_latency['request_segment_overlap_ratio']:.2f}",
+                f"- Exact duplicate request segments: {backend_latency['total_request_segment_exact_duplicate_count']}",
                 "",
                 "### By Step",
                 "",
-                "| Step | Prompt Mode | Requests | Avg Duration ms | Frontend Overhead ms | Backend Round-trip ms | Total Prompt Tokens | User Tokens | Request Segment Tokens | Duplicate Tokens (est.) | Assembled Tokens (est.) | ms / 1k Prompt Tokens | Frontend Cache Hit Rate |",
-                "| - | - | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: |",
+                "| Step | Prompt Mode | Requests | Avg Duration ms | Frontend Overhead ms | Backend Round-trip ms | Total Prompt Tokens | User Tokens | Request Segment Tokens | Serialized Segment Tokens | Segment Overlap Tokens | Segment Overlap Ratio | Duplicate Tokens (est.) | Assembled Tokens (est.) | ms / 1k Prompt Tokens | Frontend Cache Hit Rate |",
+                "| - | - | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: |",
             ]
         )
         for row in backend_latency["step_rows"]:
@@ -1286,10 +1384,29 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"{row['avg_duration_ms']:.2f} | {row['avg_frontend_overhead_ms']:.2f} | "
                 f"{row['avg_backend_roundtrip_ms']:.2f} | {row['total_prompt_tokens']} | "
                 f"{row['user_prompt_tokens_estimate']} | {row['request_segment_tokens']} | "
+                f"{row['request_segment_serialized_tokens_estimate']} | "
+                f"{row['request_segment_overlap_tokens_estimate']} | "
+                f"{row['request_segment_overlap_ratio']:.2f} | "
                 f"{row['duplicate_prompt_tokens_estimate']} | {row['assembled_prompt_tokens_estimate']} | "
                 f"{row['duration_ms_per_1k_prompt_tokens']:.2f} | "
                 f"{row['frontend_cache_hit_rate']:.2f} |"
             )
+        if backend_latency["segment_role_rows"]:
+            lines.extend(
+                [
+                    "",
+                    "### Request Segment Payload By Role",
+                    "",
+                    "| Role | Segment Occurrences | Raw Tokens | Serialized Tokens | Overlap Tokens | Overlap Ratio | Exact Duplicates |",
+                    "| - | -: | -: | -: | -: | -: | -: |",
+                ]
+            )
+            for row in backend_latency["segment_role_rows"]:
+                lines.append(
+                    f"| {row['role']} | {row['segment_occurrences']} | {row['raw_token_count']} | "
+                    f"{row['serialized_token_count']} | {row['overlap_token_estimate']} | "
+                    f"{row['overlap_ratio']:.2f} | {row['exact_duplicate_count']} |"
+                )
 
     if "providers" in report:
         lines.extend(
@@ -1757,6 +1874,11 @@ def _empty_backend_latency_summary() -> Dict[str, object]:
         "total_assembled_prompt_tokens_estimate": 0,
         "total_prompt_payload_tokens_estimate": 0,
         "total_duplicate_prompt_tokens_estimate": 0,
+        "total_request_segment_serialized_tokens_estimate": 0,
+        "total_request_segment_overlap_tokens_estimate": 0,
+        "request_segment_overlap_ratio": 0.0,
+        "total_request_segment_exact_duplicate_count": 0,
+        "segment_role_rows": [],
         "step_rows": [],
     }
 
@@ -2124,6 +2246,9 @@ def _aggregate_backend_latencies(
                     "assembled_prompt_tokens_estimate": 0,
                     "prompt_payload_tokens_estimate": 0,
                     "duplicate_prompt_tokens_estimate": 0,
+                    "request_segment_serialized_tokens_estimate": 0,
+                    "request_segment_overlap_tokens_estimate": 0,
+                    "request_segment_exact_duplicate_count": 0,
                 },
             )
             bucket["request_count"] = int(bucket["request_count"]) + int(row["request_count"])
@@ -2173,6 +2298,15 @@ def _aggregate_backend_latencies(
             bucket["duplicate_prompt_tokens_estimate"] = int(
                 bucket["duplicate_prompt_tokens_estimate"]
             ) + int(row.get("duplicate_prompt_tokens_estimate", 0))
+            bucket["request_segment_serialized_tokens_estimate"] = int(
+                bucket["request_segment_serialized_tokens_estimate"]
+            ) + int(row.get("request_segment_serialized_tokens_estimate", 0))
+            bucket["request_segment_overlap_tokens_estimate"] = int(
+                bucket["request_segment_overlap_tokens_estimate"]
+            ) + int(row.get("request_segment_overlap_tokens_estimate", 0))
+            bucket["request_segment_exact_duplicate_count"] = int(
+                bucket["request_segment_exact_duplicate_count"]
+            ) + int(row.get("request_segment_exact_duplicate_count", 0))
 
     step_rows = []
     for key in sorted(grouped):
@@ -2243,6 +2377,21 @@ def _aggregate_backend_latencies(
                 "duplicate_prompt_tokens_estimate": int(
                     bucket["duplicate_prompt_tokens_estimate"]
                 ),
+                "request_segment_serialized_tokens_estimate": int(
+                    bucket["request_segment_serialized_tokens_estimate"]
+                ),
+                "request_segment_overlap_tokens_estimate": int(
+                    bucket["request_segment_overlap_tokens_estimate"]
+                ),
+                "request_segment_overlap_ratio": (
+                    int(bucket["request_segment_overlap_tokens_estimate"])
+                    / int(bucket["request_segment_serialized_tokens_estimate"])
+                    if int(bucket["request_segment_serialized_tokens_estimate"])
+                    else 0.0
+                ),
+                "request_segment_exact_duplicate_count": int(
+                    bucket["request_segment_exact_duplicate_count"]
+                ),
             }
         )
 
@@ -2300,6 +2449,48 @@ def _aggregate_backend_latencies(
         int(latency.get("total_duplicate_prompt_tokens_estimate", 0))
         for latency in backend_latencies
     )
+    total_request_segment_serialized_tokens_estimate = sum(
+        int(latency.get("total_request_segment_serialized_tokens_estimate", 0))
+        for latency in backend_latencies
+    )
+    total_request_segment_overlap_tokens_estimate = sum(
+        int(latency.get("total_request_segment_overlap_tokens_estimate", 0))
+        for latency in backend_latencies
+    )
+    total_request_segment_exact_duplicate_count = sum(
+        int(latency.get("total_request_segment_exact_duplicate_count", 0))
+        for latency in backend_latencies
+    )
+    segment_role_rows: Dict[str, Dict[str, object]] = {}
+    for latency in backend_latencies:
+        for row in latency.get("segment_role_rows", []):
+            role = str(row.get("role", "unknown"))
+            bucket = segment_role_rows.setdefault(
+                role,
+                {
+                    "role": role,
+                    "segment_occurrences": 0,
+                    "raw_token_count": 0,
+                    "serialized_token_count": 0,
+                    "overlap_token_estimate": 0,
+                    "exact_duplicate_count": 0,
+                },
+            )
+            bucket["segment_occurrences"] = int(bucket["segment_occurrences"]) + int(
+                row.get("segment_occurrences", 0)
+            )
+            bucket["raw_token_count"] = int(bucket["raw_token_count"]) + int(
+                row.get("raw_token_count", 0)
+            )
+            bucket["serialized_token_count"] = int(
+                bucket["serialized_token_count"]
+            ) + int(row.get("serialized_token_count", 0))
+            bucket["overlap_token_estimate"] = int(
+                bucket["overlap_token_estimate"]
+            ) + int(row.get("overlap_token_estimate", 0))
+            bucket["exact_duplicate_count"] = int(
+                bucket["exact_duplicate_count"]
+            ) + int(row.get("exact_duplicate_count", 0))
 
     return {
         "request_count": request_count,
@@ -2343,6 +2534,33 @@ def _aggregate_backend_latencies(
         "total_assembled_prompt_tokens_estimate": total_assembled_prompt_tokens_estimate,
         "total_prompt_payload_tokens_estimate": total_prompt_payload_tokens_estimate,
         "total_duplicate_prompt_tokens_estimate": total_duplicate_prompt_tokens_estimate,
+        "total_request_segment_serialized_tokens_estimate": (
+            total_request_segment_serialized_tokens_estimate
+        ),
+        "total_request_segment_overlap_tokens_estimate": (
+            total_request_segment_overlap_tokens_estimate
+        ),
+        "request_segment_overlap_ratio": (
+            total_request_segment_overlap_tokens_estimate
+            / total_request_segment_serialized_tokens_estimate
+            if total_request_segment_serialized_tokens_estimate
+            else 0.0
+        ),
+        "total_request_segment_exact_duplicate_count": (
+            total_request_segment_exact_duplicate_count
+        ),
+        "segment_role_rows": [
+            {
+                **bucket,
+                "overlap_ratio": (
+                    int(bucket["overlap_token_estimate"])
+                    / int(bucket["serialized_token_count"])
+                    if int(bucket["serialized_token_count"])
+                    else 0.0
+                ),
+            }
+            for _, bucket in sorted(segment_role_rows.items())
+        ],
         "step_rows": step_rows,
     }
 

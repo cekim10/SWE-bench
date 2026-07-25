@@ -548,6 +548,83 @@ class TraceAnalysisTests(unittest.TestCase):
                     "rematerialization_savings_fraction": 1.0,
                     "service_cost_savings_fraction": 1.0,
                 },
+                "backend_latency": {
+                    "request_count": 2,
+                    "total_duration_ms": 20.0,
+                    "avg_duration_ms": 10.0,
+                    "total_backend_roundtrip_ms": 10.0,
+                    "avg_backend_roundtrip_ms": 5.0,
+                    "total_frontend_message_build_ms": 4.0,
+                    "avg_frontend_message_build_ms": 2.0,
+                    "total_frontend_token_estimate_ms": 2.0,
+                    "avg_frontend_token_estimate_ms": 1.0,
+                    "total_frontend_overhead_ms": 6.0,
+                    "avg_frontend_overhead_ms": 3.0,
+                    "total_prompt_tokens": 100,
+                    "total_completion_tokens": 20,
+                    "total_tokens": 120,
+                    "avg_prompt_tokens": 50.0,
+                    "duration_ms_per_1k_prompt_tokens": 200.0,
+                    "frontend_cache_hits": 1,
+                    "frontend_cache_hit_rate": 0.5,
+                    "total_system_prompt_tokens_estimate": 10,
+                    "total_user_prompt_tokens_estimate": 30,
+                    "total_ordered_segment_tokens": 60,
+                    "total_request_segment_tokens": 40,
+                    "total_assembled_prompt_tokens_estimate": 48,
+                    "total_prompt_payload_tokens_estimate": 56,
+                    "total_duplicate_prompt_tokens_estimate": 8,
+                    "total_request_segment_serialized_tokens_estimate": 52,
+                    "total_request_segment_overlap_tokens_estimate": 12,
+                    "request_segment_overlap_ratio": 12 / 52,
+                    "total_request_segment_exact_duplicate_count": 1,
+                    "segment_role_rows": [
+                        {
+                            "role": "TASK",
+                            "segment_occurrences": 2,
+                            "raw_token_count": 20,
+                            "serialized_token_count": 24,
+                            "overlap_token_estimate": 4,
+                            "overlap_ratio": 4 / 24,
+                            "exact_duplicate_count": 0,
+                        }
+                    ],
+                    "step_rows": [
+                        {
+                            "step_name": "planner",
+                            "prompt_mode": "segment_aware",
+                            "request_count": 2,
+                            "total_duration_ms": 20.0,
+                            "avg_duration_ms": 10.0,
+                            "total_backend_roundtrip_ms": 10.0,
+                            "avg_backend_roundtrip_ms": 5.0,
+                            "total_frontend_message_build_ms": 4.0,
+                            "avg_frontend_message_build_ms": 2.0,
+                            "total_frontend_token_estimate_ms": 2.0,
+                            "avg_frontend_token_estimate_ms": 1.0,
+                            "total_frontend_overhead_ms": 6.0,
+                            "avg_frontend_overhead_ms": 3.0,
+                            "total_prompt_tokens": 100,
+                            "total_completion_tokens": 20,
+                            "total_tokens": 120,
+                            "avg_prompt_tokens": 50.0,
+                            "duration_ms_per_1k_prompt_tokens": 200.0,
+                            "frontend_cache_hits": 1,
+                            "frontend_cache_hit_rate": 0.5,
+                            "system_prompt_tokens_estimate": 10,
+                            "user_prompt_tokens_estimate": 30,
+                            "ordered_segment_tokens": 60,
+                            "request_segment_tokens": 40,
+                            "assembled_prompt_tokens_estimate": 48,
+                            "prompt_payload_tokens_estimate": 56,
+                            "duplicate_prompt_tokens_estimate": 8,
+                            "request_segment_serialized_tokens_estimate": 52,
+                            "request_segment_overlap_tokens_estimate": 12,
+                            "request_segment_overlap_ratio": 12 / 52,
+                            "request_segment_exact_duplicate_count": 1,
+                        }
+                    ],
+                },
             },
             "run_summary": {
                 "record_count": 1,
@@ -584,6 +661,67 @@ class TraceAnalysisTests(unittest.TestCase):
         self.assertIn("## Provider Breakdown", markdown)
         self.assertIn("Pinned live fraction", markdown)
         self.assertIn("Fragmentation loss", markdown)
+        self.assertIn("Request-segment overlap ratio", markdown)
+        self.assertIn("Request Segment Payload By Role", markdown)
+        self.assertIn("| TASK | 2 | 20 | 24 | 4 |", markdown)
+
+    def test_analyze_backend_call_records_reports_segment_payload_overlap(self):
+        summary = ANALYSIS.analyze_backend_call_records(
+            [
+                {
+                    "step_name": "coder",
+                    "prompt_mode": "segment_aware",
+                    "duration_ms": 12.0,
+                    "backend_roundtrip_ms": 8.0,
+                    "frontend_message_build_ms": 1.0,
+                    "frontend_token_estimate_ms": 0.5,
+                    "frontend_overhead_ms": 1.5,
+                    "prompt_tokens": 120,
+                    "completion_tokens": 10,
+                    "total_tokens": 130,
+                    "frontend_cache_hit": False,
+                    "system_prompt_tokens_estimate": 20,
+                    "user_prompt_tokens_estimate": 12,
+                    "ordered_segment_tokens": 90,
+                    "request_segment_tokens": 70,
+                    "assembled_prompt_tokens_estimate": 82,
+                    "prompt_payload_tokens_estimate": 94,
+                    "duplicate_prompt_tokens_estimate": 12,
+                    "request_segment_serialized_tokens_estimate": 76,
+                    "request_segment_overlap_tokens_estimate": 18,
+                    "request_segment_exact_duplicate_count": 1,
+                    "request_segment_rows": [
+                        {
+                            "role": "TASK",
+                            "raw_token_count": 20,
+                            "serialized_token_count": 24,
+                            "overlap_token_estimate": 0,
+                            "exact_duplicate": False,
+                        },
+                        {
+                            "role": "PLAN",
+                            "raw_token_count": 30,
+                            "serialized_token_count": 34,
+                            "overlap_token_estimate": 18,
+                            "exact_duplicate": True,
+                        },
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(summary["total_request_segment_serialized_tokens_estimate"], 76)
+        self.assertEqual(summary["total_request_segment_overlap_tokens_estimate"], 18)
+        self.assertAlmostEqual(summary["request_segment_overlap_ratio"], 18 / 76)
+        self.assertEqual(summary["total_request_segment_exact_duplicate_count"], 1)
+        role_rows = {row["role"]: row for row in summary["segment_role_rows"]}
+        self.assertIn("TASK", role_rows)
+        self.assertIn("PLAN", role_rows)
+        self.assertEqual(role_rows["PLAN"]["exact_duplicate_count"], 1)
+        self.assertEqual(
+            summary["step_rows"][0]["request_segment_overlap_tokens_estimate"],
+            18,
+        )
 
     def test_summarize_run_output_counts_real_backend_records(self):
         with tempfile.TemporaryDirectory() as tmpdir:

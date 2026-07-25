@@ -250,7 +250,10 @@ class SegmentMaterializerTests(unittest.TestCase):
 
         self.assertIn("system-1", decision.pin_in_hbm)
         request = materializer.build_vllm_request(group)
-        self.assertEqual(request.assembled_prompt(), "You are a planner.\n\nPlan v1")
+        self.assertEqual(
+            request.assembled_prompt(),
+            "[SYSTEM]\nYou are a planner.\n\n[PLAN]\nPlan v1",
+        )
         snapshot = materializer.snapshot()
         self.assertEqual(snapshot.segment_states["system-1"], ContextSegmentState.RESIDENT)
         self.assertEqual(snapshot.segment_states["plan-1"], ContextSegmentState.RESIDENT)
@@ -295,9 +298,45 @@ class SegmentMaterializerTests(unittest.TestCase):
         self.assertEqual(messages[0]["role"], "system")
         self.assertEqual(messages[0]["content"], "You are a planner.")
         self.assertEqual(messages[1]["role"], "user")
-        self.assertTrue(messages[1]["content"].startswith("Fix bug #123."))
-        self.assertIn("1. Inspect failing path.", messages[1]["content"])
+        self.assertTrue(messages[1]["content"].startswith("[TASK]\nFix bug #123."))
+        self.assertIn("[PLAN]\n1. Inspect failing path.", messages[1]["content"])
         self.assertTrue(messages[1]["content"].endswith("Current phase: coding"))
+
+    def test_segmented_generation_request_reports_payload_rows(self):
+        task = self.make_segment(
+            state_id="task-1",
+            logical_key="prompt/task",
+            module="task",
+            version=1,
+            text="Fix bug #123.",
+            role=SegmentRole.TASK,
+        )
+        evidence = self.make_segment(
+            state_id="evidence-1",
+            logical_key="retrieval/readme",
+            module="evidence",
+            version=1,
+            text="Fix bug #123.\nREADME note.",
+            role=SegmentRole.EVIDENCE,
+        )
+        request = RUNTIME.SegmentedGenerationRequest(
+            ordered_segments=(task, evidence),
+            request_segments=(task, evidence),
+            fallback_system_prompt="You are a coder.",
+            fallback_user_prompt="Iteration: 1\nCurrent phase: coding",
+        )
+
+        rows = request.payload_rows()
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["role"], "task")
+        self.assertEqual(rows[1]["role"], "evidence")
+        self.assertGreater(rows[1]["serialized_token_count"], 0)
+        self.assertGreaterEqual(rows[1]["overlap_token_estimate"], 0)
+        self.assertGreaterEqual(
+            rows[1]["cumulative_serialized_tokens"],
+            rows[0]["serialized_token_count"],
+        )
 
     def test_policy_offloads_ephemeral_inactive_hbm_segments(self):
         materializer = SegmentMaterializer(serving_adapter=SyntheticMaterializationAdapter())

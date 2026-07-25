@@ -338,6 +338,54 @@ class SegmentedGenerationRequest:
     fallback_user_prompt: str | None = None
     enable_prefix_caching: bool = True
 
+    @staticmethod
+    def _approx_token_count(text: str) -> int:
+        return max(1, (len(text) + 3) // 4) if text else 0
+
+    @staticmethod
+    def _role_label(segment: ContextSegment) -> str:
+        role = segment.role.value if isinstance(segment.role, SegmentRole) else str(segment.role)
+        return role.upper()
+
+    @classmethod
+    def _serialize_segment(cls, segment: ContextSegment) -> str:
+        text = segment.text.strip()
+        label = cls._role_label(segment)
+        return f"[{label}]\n{text}" if text else f"[{label}]"
+
+    def payload_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        prior_token_set: set[str] = set()
+        seen_serialized_payloads: set[str] = set()
+        cumulative_serialized_tokens = 0
+
+        for position, segment in enumerate(self.request_segments or self.ordered_segments):
+            serialized = self._serialize_segment(segment)
+            serialized_tokens = self._approx_token_count(serialized)
+            cumulative_serialized_tokens += serialized_tokens
+            token_set = {token for token in serialized.lower().split() if token}
+            overlap_tokens = len(token_set & prior_token_set)
+            overlap_ratio = overlap_tokens / len(token_set) if token_set else 0.0
+            exact_duplicate = serialized in seen_serialized_payloads
+            rows.append(
+                {
+                    "position": position,
+                    "state_id": segment.state_id,
+                    "logical_id": segment.logical_id,
+                    "module": segment.identity.module,
+                    "role": self._role_label(segment).lower(),
+                    "raw_token_count": segment.token_count,
+                    "serialized_token_count": serialized_tokens,
+                    "cumulative_serialized_tokens": cumulative_serialized_tokens,
+                    "overlap_token_estimate": overlap_tokens,
+                    "overlap_ratio": overlap_ratio,
+                    "exact_duplicate": exact_duplicate,
+                }
+            )
+            prior_token_set.update(token_set)
+            seen_serialized_payloads.add(serialized)
+        return rows
+
     def assembled_prompt(self, separator: str = "\n\n") -> str:
         system_prompt = self.fallback_system_prompt or ""
         user_prompt = self.fallback_user_prompt or ""
@@ -370,9 +418,9 @@ class SegmentedGenerationRequest:
             if segment.role == SegmentRole.SYSTEM:
                 if base_system_prompt and segment.text.strip() == base_system_prompt.strip():
                     continue
-                system_parts.append(segment.text)
+                system_parts.append(self._serialize_segment(segment))
             else:
-                user_parts.append(segment.text)
+                user_parts.append(self._serialize_segment(segment))
         if base_user_prompt:
             user_parts.append(base_user_prompt)
 
