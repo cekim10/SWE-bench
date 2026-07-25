@@ -285,6 +285,17 @@ class SWEAgentPromptPack:
     submit_review_messages: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class OpenHandsPromptPack:
+    repo_path: Path
+    config_path: Path
+    agents_path: Path
+    codeact_agent_path: Path
+    default_agent_name: str
+    agents_guidance: str
+    development_guidance: str
+
+
 def _default_open_deep_research_repo_path() -> Path | None:
     candidate = Path(__file__).resolve().parents[3] / ".external" / "open_deep_research"
     return candidate if candidate.exists() else None
@@ -293,6 +304,17 @@ def _default_open_deep_research_repo_path() -> Path | None:
 def _default_swe_agent_repo_path() -> Path | None:
     candidate = Path(__file__).resolve().parents[3] / ".external" / "swe-agent"
     return candidate if candidate.exists() else None
+
+
+def _default_openhands_repo_path() -> Path | None:
+    candidates = [
+        Path(__file__).resolve().parents[3] / ".external" / "openhands",
+        Path(__file__).resolve().parents[3] / ".external" / "OpenHands",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _extract_yaml_block_scalar(source: str, key: str) -> str:
@@ -367,6 +389,15 @@ def _render_template_variables(template: str, **variables: object) -> str:
         rendered = rendered.replace(f"{{{{{key}}}}}", str(value))
         rendered = rendered.replace(f"{{{{ {key} }}}}", str(value))
     return rendered
+
+
+def _extract_toml_string_assignment(source: str, key: str) -> str | None:
+    pattern = re.compile(
+        rf"^\s*#?\s*{re.escape(key)}\s*=\s*\"(?P<value>[^\"]+)\"\s*$",
+        re.MULTILINE,
+    )
+    match = pattern.search(source)
+    return match.group("value") if match is not None else None
 
 
 def load_open_deep_research_prompt_pack(
@@ -467,6 +498,52 @@ def load_swe_agent_prompt_pack(
         submit_review_messages=tuple(
             _extract_yaml_block_scalar_list(source, "SUBMIT_REVIEW_MESSAGES")
         ),
+    )
+
+
+def load_openhands_prompt_pack(
+    repo_path: str | Path | None = None,
+) -> OpenHandsPromptPack:
+    resolved_repo_path = (
+        Path(repo_path).expanduser().resolve()
+        if repo_path is not None
+        else _default_openhands_repo_path()
+    )
+    if resolved_repo_path is None or not resolved_repo_path.exists():
+        raise RuntimeError(
+            "OpenHands repo not found. Clone OpenHands/openhands and pass "
+            "--openhands_path, or place it at './.external/openhands'."
+        )
+
+    config_path = resolved_repo_path / "config.template.toml"
+    agents_path = resolved_repo_path / "AGENTS.md"
+    codeact_agent_path = (
+        resolved_repo_path / "openhands" / "agenthub" / "codeact_agent" / "codeact_agent.py"
+    )
+    if not config_path.exists() or not agents_path.exists() or not codeact_agent_path.exists():
+        raise RuntimeError(
+            f"{resolved_repo_path} does not look like an OpenHands/openhands checkout"
+        )
+
+    config_source = config_path.read_text(encoding="utf-8")
+    default_agent_name = (
+        _extract_toml_string_assignment(config_source, "default_agent")
+        or "CodeActAgent"
+    )
+    development_path = resolved_repo_path / "Development.md"
+    development_guidance = (
+        development_path.read_text(encoding="utf-8")
+        if development_path.exists()
+        else ""
+    )
+    return OpenHandsPromptPack(
+        repo_path=resolved_repo_path,
+        config_path=config_path,
+        agents_path=agents_path,
+        codeact_agent_path=codeact_agent_path,
+        default_agent_name=default_agent_name,
+        agents_guidance=agents_path.read_text(encoding="utf-8"),
+        development_guidance=development_guidance,
     )
 
 
@@ -3305,6 +3382,232 @@ class _OpenSWEAgentPromptBackedMixin:
         )
 
 
+class _OpenHandsPromptBackedMixin:
+    def __init__(
+        self,
+        *,
+        backend: ModelBackend,
+        trace_dir: str | Path,
+        tenant_id: str = "local",
+        max_iterations: int = 2,
+        max_files: int = 5,
+        prompt_runtime_mode: str = "monolithic",
+        openhands_path: str | Path | None = None,
+    ) -> None:
+        super().__init__(
+            backend=backend,
+            trace_dir=trace_dir,
+            tenant_id=tenant_id,
+            max_iterations=max_iterations,
+            max_files=max_files,
+            prompt_runtime_mode=prompt_runtime_mode,
+        )
+        self._openhands_prompts = load_openhands_prompt_pack(openhands_path)
+
+    def _agent_family_name(self) -> str:
+        return "openhands"
+
+    def _result_workload_metadata(self) -> Dict[str, object]:
+        return {
+            "workload_source": "openhands",
+            "openhands_path": str(self._openhands_prompts.repo_path),
+            "openhands_default_agent": self._openhands_prompts.default_agent_name,
+        }
+
+    def _openhands_working_dir(self, instance: WorkflowInstance) -> str:
+        return f"/workspace/{sanitize_state_suffix(instance.instance_id)}"
+
+    def _openhands_guidance_excerpt(self) -> str:
+        agents_excerpt = truncate_text(
+            self._openhands_prompts.agents_guidance.strip().replace("\r\n", "\n"),
+            1400,
+        )
+        development_excerpt = truncate_text(
+            self._openhands_prompts.development_guidance.strip().replace("\r\n", "\n"),
+            900,
+        )
+        excerpt = agents_excerpt
+        if development_excerpt:
+            excerpt += f"\n\nDevelopment notes:\n{development_excerpt}"
+        return excerpt
+
+    def _openhands_instance_context(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+    ) -> str:
+        context = (
+            f"OpenHands working directory: {self._openhands_working_dir(instance)}\n"
+            f"Issue:\n{instance.problem_statement}\n"
+        )
+        if selected_files:
+            context += (
+                "\nCandidate files already loaded into context:\n"
+                + "\n".join(f"- {path}" for path in sorted(selected_files))
+            )
+        return context
+
+    def _system_prompt_text(self) -> str:
+        return (
+            f"You are operating in an OpenHands-style {self._openhands_prompts.default_agent_name} "
+            "software-engineering workflow. Follow the repository guidance below while "
+            "planning, patching, reviewing, and verifying.\n\n"
+            f"{self._openhands_guidance_excerpt()}"
+        )
+
+    def _router_system_prompt(self) -> str:
+        return self._system_prompt_text()
+
+    def _router_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        iteration: int,
+        diagnostic_state_id: str | None,
+    ) -> str:
+        diagnostic_text = (
+            f"\n\nPrevious failure context:\n{diagnostic_state_id}"
+            if diagnostic_state_id is not None
+            else ""
+        )
+        return (
+            f"{self._openhands_instance_context(instance, selected_files)}{diagnostic_text}\n\n"
+            f"Iteration: {iteration}\n"
+            "Current phase: choose the next OpenHands repair route."
+        )
+
+    def _router_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        iteration: int,
+        diagnostic_state_id: str | None,
+    ) -> str:
+        return (
+            f"{self._openhands_instance_context(instance, selected_files)}\n\n"
+            f"Iteration: {iteration}\n"
+            + (
+                f"Previous failure context segment: {diagnostic_state_id}\n"
+                if diagnostic_state_id is not None
+                else ""
+            )
+            + "Use the provided context segments to choose the next OpenHands route."
+        )
+
+    def _planner_system_prompt(self) -> str:
+        return self._system_prompt_text()
+
+    def _planner_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        iteration: int,
+        diagnostic_state_id: str | None,
+    ) -> str:
+        diagnostic_text = (
+            f"\n\nPrevious failure context:\n{diagnostic_state_id}"
+            if diagnostic_state_id is not None
+            else ""
+        )
+        return (
+            f"{self._openhands_instance_context(instance, selected_files)}{diagnostic_text}\n\n"
+            f"Iteration: {iteration}\n"
+            "Current phase: produce the next concise CodeAct-style repair plan."
+        )
+
+    def _coder_system_prompt(self) -> str:
+        return self._system_prompt_text()
+
+    def _coder_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        plan_text: str,
+        iteration: int,
+    ) -> str:
+        return (
+            f"{self._openhands_instance_context(instance, selected_files)}\n\n"
+            f"Iteration: {iteration}\n"
+            f"Plan:\n{plan_text}\n\n"
+            "Current phase: produce the minimal patch needed to advance the fix."
+        )
+
+    def _coder_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Issue:\n{instance.problem_statement}\n\n"
+            f"Iteration: {iteration}\n"
+            "Use the active route, plan, and repository context segments to produce the next "
+            "OpenHands patch revision."
+        )
+
+    def _reviewer_system_prompt(self) -> str:
+        return self._system_prompt_text()
+
+    def _reviewer_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        plan_text: str,
+        patch_text: str,
+        iteration: int,
+    ) -> str:
+        return (
+            f"{self._openhands_instance_context(instance, {})}\n\n"
+            f"Iteration: {iteration}\n"
+            f"Plan:\n{plan_text}\n\n"
+            f"Patch under review:\n{patch_text}\n"
+        )
+
+    def _reviewer_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Issue:\n{instance.problem_statement}\n\n"
+            f"Iteration: {iteration}\n"
+            "Review the candidate patch using the provided context segments and identify "
+            "remaining OpenHands-style execution risks before verification."
+        )
+
+    def _tester_system_prompt(self) -> str:
+        return (
+            f"{self._system_prompt_text()}\n\n"
+            "When verifying a candidate patch, respond with PASS or FAIL on the first line."
+        )
+
+    def _tester_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        plan_text: str,
+        patch_text: str,
+        iteration: int,
+    ) -> str:
+        return (
+            f"{self._openhands_instance_context(instance, {})}\n\n"
+            f"Iteration: {iteration}\n"
+            f"Plan:\n{plan_text}\n\n"
+            f"Patch:\n{patch_text}\n\n"
+            "Current phase: judge whether the patch resolves the issue and summarize the "
+            "verification outcome."
+        )
+
+    def _tester_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Issue:\n{instance.problem_statement}\n\n"
+            f"Iteration: {iteration}\n"
+            "Use the active patch and review context segments to decide whether the issue is "
+            "resolved and what failure diagnostics should persist."
+        )
+
+
 class SyntheticStressTracedAgentRunner(TracedAgentRunner):
     def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
         trace_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}.jsonl"
@@ -5154,5 +5457,11 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
 
 class OpenSWEAgentTracedAgentRunner(
     _OpenSWEAgentPromptBackedMixin, LangGraphTracedAgentRunner
+):
+    pass
+
+
+class OpenHandsTracedAgentRunner(
+    _OpenHandsPromptBackedMixin, LangGraphTracedAgentRunner
 ):
     pass

@@ -483,6 +483,145 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 all(call.get("segment_request") is not None for call in backend.calls)
             )
 
+    def test_load_openhands_prompt_pack_from_repo_checkout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "openhands"
+            codeact_dir = repo_root / "openhands" / "agenthub" / "codeact_agent"
+            codeact_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "config.template.toml").write_text(
+                dedent(
+                    """
+                    #default_agent = "CodeActAgent"
+                    [agent]
+                    enable_editor = true
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text(
+                "UPSTREAM_OPENHANDS_GUIDE\n\nRun tests with pytest.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "Development.md").write_text(
+                "UPSTREAM_OPENHANDS_DEV\n\nUse make build for setup.\n",
+                encoding="utf-8",
+            )
+            (codeact_dir / "codeact_agent.py").write_text(
+                "class CodeActAgent:\n    pass\n",
+                encoding="utf-8",
+            )
+
+            prompt_pack = AGENTIC.load_openhands_prompt_pack(repo_root)
+            self.assertEqual(prompt_pack.repo_path, repo_root.resolve())
+            self.assertEqual(prompt_pack.default_agent_name, "CodeActAgent")
+            self.assertIn("UPSTREAM_OPENHANDS_GUIDE", prompt_pack.agents_guidance)
+
+    @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
+    def test_openhands_runner_uses_upstream_prompt_pack(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "openhands"
+            codeact_dir = repo_root / "openhands" / "agenthub" / "codeact_agent"
+            codeact_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "config.template.toml").write_text(
+                dedent(
+                    """
+                    #default_agent = "CodeActAgent"
+                    [agent]
+                    enable_editor = true
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text(
+                "UPSTREAM_OPENHANDS_GUIDE\n\nPrefer pytest and repository-aware edits.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "Development.md").write_text(
+                "UPSTREAM_OPENHANDS_DEV\n\nUse make build for setup.\n",
+                encoding="utf-8",
+            )
+            (codeact_dir / "codeact_agent.py").write_text(
+                "class CodeActAgent:\n    pass\n",
+                encoding="utf-8",
+            )
+
+            backend = self.CapturingBackend()
+            runner = AGENTIC.OpenHandsTracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=2,
+                prompt_runtime_mode="segment_aware",
+                openhands_path=repo_root,
+            )
+            result = runner.run_instance(AGENTIC.build_demo_instance())
+            self.assertEqual(result["agent_family"], "openhands")
+            self.assertEqual(result["workload_source"], "openhands")
+            self.assertEqual(Path(result["openhands_path"]), repo_root.resolve())
+            self.assertGreater(len(backend.calls), 0)
+            self.assertTrue(
+                any(
+                    "UPSTREAM_OPENHANDS_GUIDE" in call.get("system_prompt", "")
+                    for call in backend.calls
+                )
+            )
+            self.assertTrue(
+                any(
+                    "CodeActAgent" in call.get("system_prompt", "")
+                    for call in backend.calls
+                )
+            )
+
+    @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
+    def test_openhands_monolithic_flattens_active_context_for_backend(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "openhands"
+            codeact_dir = repo_root / "openhands" / "agenthub" / "codeact_agent"
+            codeact_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "config.template.toml").write_text(
+                dedent(
+                    """
+                    #default_agent = "CodeActAgent"
+                    [agent]
+                    enable_editor = true
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text(
+                "UPSTREAM_OPENHANDS_GUIDE\n\nPrefer pytest and repository-aware edits.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "Development.md").write_text(
+                "UPSTREAM_OPENHANDS_DEV\n\nUse make build for setup.\n",
+                encoding="utf-8",
+            )
+            (codeact_dir / "codeact_agent.py").write_text(
+                "class CodeActAgent:\n    pass\n",
+                encoding="utf-8",
+            )
+
+            backend = self.CapturingBackend()
+            runner = AGENTIC.OpenHandsTracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=2,
+                prompt_runtime_mode="monolithic",
+                openhands_path=repo_root,
+            )
+            result = runner.run_instance(AGENTIC.build_demo_instance())
+            self.assertEqual(result["agent_family"], "openhands")
+            self.assertGreater(len(backend.calls), 0)
+            self.assertTrue(
+                all(call.get("prompt_mode") == "monolithic" for call in backend.calls)
+            )
+            self.assertTrue(
+                all(call.get("segment_request") is not None for call in backend.calls)
+            )
+
     @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
     def test_real_langgraph_runner_emits_router_and_reviewer_states(self):
         with tempfile.TemporaryDirectory() as tmpdir:
