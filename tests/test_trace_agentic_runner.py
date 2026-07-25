@@ -345,6 +345,144 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 all(call.get("segment_request") is not None for call in backend.calls)
             )
 
+    def test_load_swe_agent_prompt_pack_from_repo_checkout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "swe_agent"
+            config_dir = repo_root / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "default.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      templates:
+                        system_template: |-
+                          UPSTREAM_SWE_SYSTEM
+                        instance_template: |-
+                          repo {{working_dir}}
+                          issue {{problem_statement}}
+                        next_step_template: |-
+                          OBSERVATION:
+                          {{observation}}
+                        next_step_no_output_template: |-
+                          no output
+                      tools:
+                        registry_variables:
+                          SUBMIT_REVIEW_MESSAGES:
+                            - |
+                              review {{diff}}
+                    """
+                ),
+                encoding="utf-8",
+            )
+            prompt_pack = AGENTIC.load_swe_agent_prompt_pack(repo_root)
+            self.assertEqual(prompt_pack.repo_path, repo_root.resolve())
+            self.assertIn("UPSTREAM_SWE_SYSTEM", prompt_pack.system_template)
+            self.assertEqual(len(prompt_pack.submit_review_messages), 1)
+
+    @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
+    def test_open_swe_agent_runner_uses_upstream_prompt_pack(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "swe_agent"
+            config_dir = repo_root / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "default.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      templates:
+                        system_template: |-
+                          UPSTREAM_SWE_SYSTEM
+                        instance_template: |-
+                          repo {{working_dir}}
+                          issue {{problem_statement}}
+                        next_step_template: |-
+                          OBSERVATION:
+                          {{observation}}
+                        next_step_no_output_template: |-
+                          no output
+                      tools:
+                        registry_variables:
+                          SUBMIT_REVIEW_MESSAGES:
+                            - |
+                              review {{diff}}
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            backend = self.CapturingBackend()
+            runner = AGENTIC.OpenSWEAgentTracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=2,
+                prompt_runtime_mode="segment_aware",
+                swe_agent_path=repo_root,
+            )
+            result = runner.run_instance(AGENTIC.build_demo_instance())
+            self.assertEqual(result["agent_family"], "swe_agent")
+            self.assertEqual(result["workload_source"], "swe_agent")
+            self.assertEqual(Path(result["swe_agent_path"]), repo_root.resolve())
+            self.assertGreater(len(backend.calls), 0)
+            self.assertTrue(
+                any(
+                    "UPSTREAM_SWE_SYSTEM" in call.get("system_prompt", "")
+                    for call in backend.calls
+                )
+            )
+
+    @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
+    def test_open_swe_agent_monolithic_flattens_active_context_for_backend(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "swe_agent"
+            config_dir = repo_root / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "default.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      templates:
+                        system_template: |-
+                          UPSTREAM_SWE_SYSTEM
+                        instance_template: |-
+                          repo {{working_dir}}
+                          issue {{problem_statement}}
+                        next_step_template: |-
+                          OBSERVATION:
+                          {{observation}}
+                        next_step_no_output_template: |-
+                          no output
+                      tools:
+                        registry_variables:
+                          SUBMIT_REVIEW_MESSAGES:
+                            - |
+                              review {{diff}}
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            backend = self.CapturingBackend()
+            runner = AGENTIC.OpenSWEAgentTracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=2,
+                prompt_runtime_mode="monolithic",
+                swe_agent_path=repo_root,
+            )
+            result = runner.run_instance(AGENTIC.build_demo_instance())
+            self.assertEqual(result["agent_family"], "swe_agent")
+            self.assertGreater(len(backend.calls), 0)
+            self.assertTrue(
+                all(call.get("prompt_mode") == "monolithic" for call in backend.calls)
+            )
+            self.assertTrue(
+                all(call.get("segment_request") is not None for call in backend.calls)
+            )
+
     @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
     def test_real_langgraph_runner_emits_router_and_reviewer_states(self):
         with tempfile.TemporaryDirectory() as tmpdir:

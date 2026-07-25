@@ -274,9 +274,99 @@ class OpenDeepResearchPromptPack:
     final_report_generation_prompt: str
 
 
+@dataclass(frozen=True)
+class SWEAgentPromptPack:
+    repo_path: Path
+    config_path: Path
+    system_template: str
+    instance_template: str
+    next_step_template: str
+    next_step_no_output_template: str
+    submit_review_messages: tuple[str, ...]
+
+
 def _default_open_deep_research_repo_path() -> Path | None:
     candidate = Path(__file__).resolve().parents[3] / ".external" / "open_deep_research"
     return candidate if candidate.exists() else None
+
+
+def _default_swe_agent_repo_path() -> Path | None:
+    candidate = Path(__file__).resolve().parents[3] / ".external" / "swe-agent"
+    return candidate if candidate.exists() else None
+
+
+def _extract_yaml_block_scalar(source: str, key: str) -> str:
+    pattern = re.compile(rf"^(?P<indent>\s*){re.escape(key)}:\s*[>|][+-]?\s*$")
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        match = pattern.match(line)
+        if match is None:
+            continue
+        block_indent = len(match.group("indent")) + 2
+        collected: List[str] = []
+        for next_line in lines[index + 1 :]:
+            stripped = next_line.strip()
+            current_indent = len(next_line) - len(next_line.lstrip(" "))
+            if stripped and current_indent < block_indent:
+                break
+            if not stripped:
+                collected.append("")
+            elif len(next_line) >= block_indent:
+                collected.append(next_line[block_indent:])
+            else:
+                collected.append("")
+        return "\n".join(collected).rstrip()
+    raise RuntimeError(f"missing YAML block scalar for {key}")
+
+
+def _extract_yaml_block_scalar_list(source: str, key: str) -> List[str]:
+    pattern = re.compile(rf"^(?P<indent>\s*){re.escape(key)}:\s*$")
+    item_pattern = re.compile(r"^(?P<indent>\s*)-\s*[>|][+-]?\s*$")
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        match = pattern.match(line)
+        if match is None:
+            continue
+        key_indent = len(match.group("indent"))
+        values: List[str] = []
+        cursor = index + 1
+        while cursor < len(lines):
+            item_line = lines[cursor]
+            stripped = item_line.strip()
+            current_indent = len(item_line) - len(item_line.lstrip(" "))
+            if stripped and current_indent <= key_indent:
+                break
+            item_match = item_pattern.match(item_line)
+            if item_match is None:
+                cursor += 1
+                continue
+            block_indent = len(item_match.group("indent")) + 2
+            cursor += 1
+            collected: List[str] = []
+            while cursor < len(lines):
+                next_line = lines[cursor]
+                next_stripped = next_line.strip()
+                next_indent = len(next_line) - len(next_line.lstrip(" "))
+                if next_stripped and next_indent < block_indent:
+                    break
+                if not next_stripped:
+                    collected.append("")
+                elif len(next_line) >= block_indent:
+                    collected.append(next_line[block_indent:])
+                else:
+                    collected.append("")
+                cursor += 1
+            values.append("\n".join(collected).rstrip())
+        return values
+    return []
+
+
+def _render_template_variables(template: str, **variables: object) -> str:
+    rendered = template
+    for key, value in variables.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", str(value))
+        rendered = rendered.replace(f"{{{{ {key} }}}}", str(value))
+    return rendered
 
 
 def load_open_deep_research_prompt_pack(
@@ -341,6 +431,42 @@ def load_open_deep_research_prompt_pack(
             module.compress_research_simple_human_message
         ),
         final_report_generation_prompt=str(module.final_report_generation_prompt),
+    )
+
+
+def load_swe_agent_prompt_pack(
+    repo_path: str | Path | None = None,
+) -> SWEAgentPromptPack:
+    resolved_repo_path = (
+        Path(repo_path).expanduser().resolve()
+        if repo_path is not None
+        else _default_swe_agent_repo_path()
+    )
+    if resolved_repo_path is None or not resolved_repo_path.exists():
+        raise RuntimeError(
+            "swe-agent repo not found. Clone swe-agent/swe-agent and pass "
+            "--swe_agent_path, or place it at './.external/swe-agent'."
+        )
+
+    config_path = resolved_repo_path / "config" / "default.yaml"
+    if not config_path.exists():
+        raise RuntimeError(
+            f"{resolved_repo_path} does not look like a swe-agent checkout"
+        )
+
+    source = config_path.read_text(encoding="utf-8")
+    return SWEAgentPromptPack(
+        repo_path=resolved_repo_path,
+        config_path=config_path,
+        system_template=_extract_yaml_block_scalar(source, "system_template"),
+        instance_template=_extract_yaml_block_scalar(source, "instance_template"),
+        next_step_template=_extract_yaml_block_scalar(source, "next_step_template"),
+        next_step_no_output_template=_extract_yaml_block_scalar(
+            source, "next_step_no_output_template"
+        ),
+        submit_review_messages=tuple(
+            _extract_yaml_block_scalar_list(source, "SUBMIT_REVIEW_MESSAGES")
+        ),
     )
 
 
@@ -2934,6 +3060,227 @@ class LangGraphStyleTracedAgentRunner(TracedAgentRunner):
             "Review the candidate patch using the provided context segments and decide "
             "whether it is ready for verification."
         )
+class _OpenSWEAgentPromptBackedMixin:
+    def __init__(
+        self,
+        *,
+        backend: ModelBackend,
+        trace_dir: str | Path,
+        tenant_id: str = "local",
+        max_iterations: int = 2,
+        max_files: int = 5,
+        prompt_runtime_mode: str = "monolithic",
+        swe_agent_path: str | Path | None = None,
+    ) -> None:
+        super().__init__(
+            backend=backend,
+            trace_dir=trace_dir,
+            tenant_id=tenant_id,
+            max_iterations=max_iterations,
+            max_files=max_files,
+            prompt_runtime_mode=prompt_runtime_mode,
+        )
+        self._swe_agent_prompts = load_swe_agent_prompt_pack(swe_agent_path)
+
+    def _agent_family_name(self) -> str:
+        return "swe_agent"
+
+    def _result_workload_metadata(self) -> Dict[str, object]:
+        return {
+            "workload_source": "swe_agent",
+            "swe_agent_path": str(self._swe_agent_prompts.repo_path),
+        }
+
+    def _swe_agent_working_dir(self, instance: WorkflowInstance) -> str:
+        return f"/workspace/{sanitize_state_suffix(instance.instance_id)}"
+
+    def _swe_agent_instance_context(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+    ) -> str:
+        rendered = _render_template_variables(
+            self._swe_agent_prompts.instance_template,
+            working_dir=self._swe_agent_working_dir(instance),
+            problem_statement=instance.problem_statement,
+        )
+        if not selected_files:
+            return rendered
+        return (
+            f"{rendered}\n\n"
+            "Relevant files currently loaded into context:\n"
+            + "\n".join(f"- {path}" for path in sorted(selected_files))
+        )
+
+    def _swe_agent_observation(self, observation: str) -> str:
+        template = (
+            self._swe_agent_prompts.next_step_template
+            if observation.strip()
+            else self._swe_agent_prompts.next_step_no_output_template
+        )
+        return _render_template_variables(template, observation=observation)
+
+    def _swe_agent_review_message(self, patch_text: str) -> str:
+        template = (
+            self._swe_agent_prompts.submit_review_messages[0]
+            if self._swe_agent_prompts.submit_review_messages
+            else (
+                "Review the current patch carefully, verify that it addresses the issue, "
+                "and identify any residual risk before submission.\n\n<diff>\n{{diff}}\n</diff>"
+            )
+        )
+        return _render_template_variables(template, diff=patch_text)
+
+    def _system_prompt_text(self) -> str:
+        return self._swe_agent_prompts.system_template
+
+    def _router_system_prompt(self) -> str:
+        return self._swe_agent_prompts.system_template
+
+    def _router_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        iteration: int,
+        diagnostic_state_id: str | None,
+    ) -> str:
+        diagnostic_text = (
+            f"\n\nPrevious failure context:\n{diagnostic_state_id}"
+            if diagnostic_state_id is not None
+            else ""
+        )
+        return (
+            f"{self._swe_agent_instance_context(instance, selected_files)}{diagnostic_text}\n\n"
+            f"Iteration: {iteration}\n"
+            "Current phase: inspect the issue and decide the next repair route."
+        )
+
+    def _router_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        iteration: int,
+        diagnostic_state_id: str | None,
+    ) -> str:
+        return (
+            f"{self._swe_agent_instance_context(instance, selected_files)}\n\n"
+            f"{self._swe_agent_observation('Use the already provided context segments to choose the next repair route.')}\n"
+            f"Iteration: {iteration}\n"
+            + (
+                f"Previous failure context segment: {diagnostic_state_id}\n"
+                if diagnostic_state_id is not None
+                else ""
+            )
+        )
+
+    def _planner_system_prompt(self) -> str:
+        return self._swe_agent_prompts.system_template
+
+    def _planner_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        iteration: int,
+        diagnostic_state_id: str | None,
+    ) -> str:
+        diagnostic_text = (
+            f"\n\nPrevious failure context:\n{diagnostic_state_id}"
+            if diagnostic_state_id is not None
+            else ""
+        )
+        return (
+            f"{self._swe_agent_instance_context(instance, selected_files)}{diagnostic_text}\n\n"
+            f"Iteration: {iteration}\n"
+            "Current phase: produce a concise repair plan before editing."
+        )
+
+    def _coder_system_prompt(self) -> str:
+        return self._swe_agent_prompts.system_template
+
+    def _coder_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        selected_files: Mapping[str, str],
+        plan_text: str,
+        iteration: int,
+    ) -> str:
+        return (
+            f"{self._swe_agent_instance_context(instance, selected_files)}\n\n"
+            f"Iteration: {iteration}\n"
+            f"Plan:\n{plan_text}\n\n"
+            "Current phase: produce the minimal unified diff patch."
+        )
+
+    def _coder_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Issue:\n{instance.problem_statement}\n\n"
+            f"{self._swe_agent_observation('Use the active route, plan, and repository context to produce the next patch revision.')}\n"
+            f"Iteration: {iteration}\n"
+        )
+
+    def _reviewer_system_prompt(self) -> str:
+        return self._swe_agent_prompts.system_template
+
+    def _reviewer_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        plan_text: str,
+        patch_text: str,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Issue:\n{instance.problem_statement}\n\n"
+            f"Plan:\n{plan_text}\n\n"
+            f"{self._swe_agent_review_message(patch_text)}\n\n"
+            f"Iteration: {iteration}\n"
+        )
+
+    def _reviewer_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Issue:\n{instance.problem_statement}\n\n"
+            f"{self._swe_agent_observation('Review the active patch and summarize whether it is ready for verification.')}\n"
+            f"Iteration: {iteration}\n"
+        )
+
+    def _tester_system_prompt(self) -> str:
+        return (
+            f"{self._swe_agent_prompts.system_template}\n\n"
+            "When verifying a candidate patch, respond with PASS or FAIL on the first line."
+        )
+
+    def _tester_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        plan_text: str,
+        patch_text: str,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Issue:\n{instance.problem_statement}\n\n"
+            f"Plan:\n{plan_text}\n\n"
+            f"Patch:\n{patch_text}\n\n"
+            f"Iteration: {iteration}\n"
+            "Decide whether the patch is ready to submit."
+        )
+
+    def _tester_instruction_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Issue:\n{instance.problem_statement}\n\n"
+            f"{self._swe_agent_observation('Verify the active patch against the issue and return PASS or FAIL.')}\n"
+            f"Iteration: {iteration}\n"
+        )
 
     def _reviewer_instruction_prompt(
         self,
@@ -3969,6 +4316,12 @@ class OpenDeepResearchTracedAgentRunner(DeepResearchTracedAgentRunner):
 
 
 class LangGraphTracedAgentRunner(TracedAgentRunner):
+    def _agent_family_name(self) -> str:
+        return "langgraph"
+
+    def _result_workload_metadata(self) -> Dict[str, object]:
+        return {}
+
     def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
         StateGraph, START, END = _load_langgraph_symbols()
 
@@ -3977,6 +4330,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
         backend_call_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}_backend_calls.jsonl"
         selected_files = self._select_files(instance)
         self._reset_monolithic_prompt_runtime_state()
+        agent_family = self._agent_family_name()
 
         with TraceLogger(
             trace_path,
@@ -4004,7 +4358,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     is_shared=True,
                     is_ephemeral=False,
                     update_cause="static",
-                    agent_family="langgraph",
+                    agent_family=agent_family,
                 ),
             )
             self._register_runtime_segment(
@@ -4018,7 +4372,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                 is_shared=True,
                 is_immutable=True,
                 is_ephemeral=False,
-                metadata={"agent_family": "langgraph"},
+                metadata={"agent_family": agent_family},
             )
             task_state = trace.create_state(
                 state_id="task_v1",
@@ -4037,7 +4391,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     is_shared=True,
                     is_ephemeral=False,
                     update_cause="task_fixed",
-                    agent_family="langgraph",
+                    agent_family=agent_family,
                 ),
             )
             self._register_runtime_segment(
@@ -4051,7 +4405,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                 is_shared=True,
                 is_immutable=True,
                 is_ephemeral=False,
-                metadata={"agent_family": "langgraph"},
+                metadata={"agent_family": agent_family},
             )
             readme_states = self._create_text_states(
                 trace=trace,
@@ -4093,7 +4447,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     is_shared=True,
                     is_immutable=True,
                     is_ephemeral=False,
-                    metadata={"agent_family": "langgraph"},
+                    metadata={"agent_family": agent_family},
                 )
             for state, (_, contents) in zip(doc_states, sorted(selected_files.items())):
                 self._register_runtime_segment(
@@ -4107,7 +4461,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=True,
                     is_ephemeral=False,
-                    metadata={"agent_family": "langgraph"},
+                    metadata={"agent_family": agent_family},
                 )
             live_state_ids = {system_state.state_id, task_state.state_id}
             live_state_ids.update(state.state_id for state in readme_states)
@@ -4191,7 +4545,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                         is_ephemeral=True,
                         update_cause="reroute",
                         iteration=iteration,
-                        agent_family="langgraph",
+                        agent_family=agent_family,
                     ),
                 )
                 self._register_runtime_segment(
@@ -4205,7 +4559,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=False,
                     is_ephemeral=True,
-                    metadata={"agent_family": "langgraph"},
+                    metadata={"agent_family": agent_family},
                 )
                 live_state_ids.add(route_state.state_id)
                 current_route_id = state.get("current_route_id")
@@ -4290,7 +4644,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                         is_ephemeral=False,
                         update_cause="replan",
                         iteration=iteration,
-                        agent_family="langgraph",
+                        agent_family=agent_family,
                     ),
                 )
                 self._register_runtime_segment(
@@ -4304,7 +4658,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=False,
                     is_ephemeral=False,
-                    metadata={"agent_family": "langgraph"},
+                    metadata={"agent_family": agent_family},
                 )
                 live_state_ids.add(plan_state.state_id)
                 current_plan_id = state.get("current_plan_id")
@@ -4382,7 +4736,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                         is_ephemeral=True,
                         update_cause="repatch",
                         iteration=iteration,
-                        agent_family="langgraph",
+                        agent_family=agent_family,
                     ),
                 )
                 self._register_runtime_segment(
@@ -4396,7 +4750,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=False,
                     is_ephemeral=True,
-                    metadata={"agent_family": "langgraph"},
+                    metadata={"agent_family": agent_family},
                 )
                 live_state_ids.add(patch_state.state_id)
                 current_patch_id = state.get("current_patch_id")
@@ -4466,7 +4820,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                         is_ephemeral=True,
                         update_cause="review_update",
                         iteration=iteration,
-                        agent_family="langgraph",
+                        agent_family=agent_family,
                     ),
                 )
                 self._register_runtime_segment(
@@ -4480,7 +4834,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=False,
                     is_ephemeral=True,
-                    metadata={"agent_family": "langgraph"},
+                    metadata={"agent_family": agent_family},
                 )
                 live_state_ids.add(review_state.state_id)
                 current_review_id = state.get("current_review_id")
@@ -4546,7 +4900,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                         is_ephemeral=True,
                         update_cause="retest",
                         iteration=iteration,
-                        agent_family="langgraph",
+                        agent_family=agent_family,
                     ),
                 )
                 self._register_runtime_segment(
@@ -4560,7 +4914,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=False,
                     is_ephemeral=True,
-                    metadata={"agent_family": "langgraph"},
+                    metadata={"agent_family": agent_family},
                 )
                 live_state_ids.add(verification_state.state_id)
                 current_verification_id = state.get("current_verification_id")
@@ -4608,7 +4962,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                         is_ephemeral=True,
                         update_cause="failure_feedback",
                         iteration=iteration,
-                        agent_family="langgraph",
+                        agent_family=agent_family,
                     ),
                 )
                 self._register_runtime_segment(
@@ -4622,7 +4976,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=False,
                     is_ephemeral=True,
-                    metadata={"agent_family": "langgraph"},
+                    metadata={"agent_family": agent_family},
                 )
                 live_state_ids.add(diagnostic_state.state_id)
                 previous_diagnostic_state_id = state.get("diagnostic_state_id")
@@ -4691,7 +5045,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             materializer=materializer,
             runtime_event_path=runtime_event_path,
             workflow_id=instance.instance_id,
-            agent_family="langgraph",
+            agent_family=agent_family,
         )
         self._write_backend_call_records(
             backend_call_path=backend_call_path,
@@ -4702,7 +5056,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             "instance_id": instance.instance_id,
             "status": str(final_state.get("status", "UNRESOLVED")),
             "provider": getattr(self.backend, "name", self.backend.__class__.__name__),
-            "agent_family": "langgraph",
+            "agent_family": agent_family,
             "prompt_runtime_mode": self.prompt_runtime_mode,
             "plan": str(final_state.get("final_plan_text", "")),
             "patch": str(final_state.get("final_patch_text", "")),
@@ -4717,6 +5071,7 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                 "errors": validation.errors,
                 "summary": validation.summary,
             },
+            **self._result_workload_metadata(),
         }
 
     def _router_system_prompt(self) -> str:
@@ -4795,3 +5150,9 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
             "Review the candidate patch using the provided context segments and decide "
             "whether it is ready for verification."
         )
+
+
+class OpenSWEAgentTracedAgentRunner(
+    _OpenSWEAgentPromptBackedMixin, LangGraphTracedAgentRunner
+):
+    pass
