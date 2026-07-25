@@ -17,6 +17,7 @@ from swebench.inference.runtime.segment_materializer import (
     ContextSegmentGroup,
     ResidencyTier,
     RuntimeResidencySnapshot,
+    SegmentRole,
     SegmentIdentity,
     SegmentRuntime,
     SegmentedGenerationRequest,
@@ -132,6 +133,41 @@ def _segment_payload_metrics(
             overlap_tokens / serialized_tokens if serialized_tokens else 0.0
         ),
         "request_segment_exact_duplicate_count": exact_duplicate_count,
+    }
+
+
+def _execution_context_metrics(
+    *,
+    prompt_group: ContextSegmentGroup | None,
+    segment_request: SegmentedGenerationRequest | None,
+) -> Dict[str, object]:
+    if prompt_group is None or segment_request is None:
+        return {
+            "execution_context_segment_ids": [],
+            "execution_context_rows": [],
+            "request_segment_ids": [],
+        }
+    ordered_ids = list(prompt_group.ordered_segment_ids)
+    rows = []
+    for position, segment in enumerate(segment_request.ordered_segments):
+        rows.append(
+            {
+                "position": position,
+                "state_id": segment.segment_id,
+                "logical_id": segment.logical_id,
+                "module": segment.identity.module,
+                "role": (
+                    segment.role.value if isinstance(segment.role, SegmentRole) else str(segment.role)
+                ),
+                "predecessor_segment_ids": ordered_ids[:position],
+            }
+        )
+    return {
+        "execution_context_segment_ids": ordered_ids,
+        "execution_context_rows": rows,
+        "request_segment_ids": [
+            segment.segment_id for segment in segment_request.request_segments
+        ],
     }
 
 
@@ -678,6 +714,10 @@ class StubModelBackend:
         segment_payload_metrics = _segment_payload_metrics(
             segment_request=segment_request,
         )
+        execution_context_metrics = _execution_context_metrics(
+            prompt_group=prompt_group,
+            segment_request=segment_request,
+        )
         frontend_token_estimate_ms = (
             time.perf_counter() - prompt_metrics_started_at
         ) * 1000.0
@@ -798,6 +838,13 @@ class StubModelBackend:
                     "duplicate_prompt_tokens_estimate"
                 ],
                 "request_segment_rows": segment_payload_metrics["request_segment_rows"],
+                "execution_context_segment_ids": execution_context_metrics[
+                    "execution_context_segment_ids"
+                ],
+                "execution_context_rows": execution_context_metrics[
+                    "execution_context_rows"
+                ],
+                "request_segment_ids": execution_context_metrics["request_segment_ids"],
                 "request_segment_serialized_tokens_estimate": segment_payload_metrics[
                     "request_segment_serialized_tokens_estimate"
                 ],
@@ -1081,6 +1128,10 @@ class VLLMServerChatBackend:
         segment_payload_metrics = _segment_payload_metrics(
             segment_request=segment_request,
         )
+        execution_context_metrics = _execution_context_metrics(
+            prompt_group=prompt_group,
+            segment_request=segment_request,
+        )
         frontend_token_estimate_ms = (
             time.perf_counter() - prompt_metrics_started_at
         ) * 1000.0
@@ -1130,6 +1181,13 @@ class VLLMServerChatBackend:
                     "duplicate_prompt_tokens_estimate"
                 ],
                 "request_segment_rows": segment_payload_metrics["request_segment_rows"],
+                "execution_context_segment_ids": execution_context_metrics[
+                    "execution_context_segment_ids"
+                ],
+                "execution_context_rows": execution_context_metrics[
+                    "execution_context_rows"
+                ],
+                "request_segment_ids": execution_context_metrics["request_segment_ids"],
                 "request_segment_serialized_tokens_estimate": segment_payload_metrics[
                     "request_segment_serialized_tokens_estimate"
                 ],
@@ -2558,11 +2616,14 @@ class TracedAgentRunner:
         role: str,
         update_cause: str | None = None,
     ) -> Dict[str, object]:
+        cached_segment = self._runtime_segment_cache.get(state_id)
         return {
             "state_id": state_id,
             "context_module": context_module,
             "segment_role": role,
             "update_cause": update_cause or "read",
+            "token_count": cached_segment.token_count if cached_segment is not None else 0,
+            "logical_id": cached_segment.logical_id if cached_segment is not None else None,
         }
 
     def _system_prompt_text(self) -> str:
@@ -3580,6 +3641,28 @@ class _OpenSWEAgentPromptBackedMixin:
 
 
 class _OpenHandsPromptBackedMixin:
+    _OPENHANDS_MANDATORY_ROLES_BY_STEP = {
+        "router": {"task", "scratchpad"},
+        "planner": {"task", "router", "scratchpad"},
+        "coder": {"task", "plan", "artifact"},
+        "reviewer": {"task", "plan", "artifact"},
+        "tester": {"task", "artifact", "review"},
+    }
+    _OPENHANDS_EVIDENCE_TOKEN_BUDGET_BY_STEP = {
+        "router": 900,
+        "planner": 1400,
+        "coder": 900,
+        "reviewer": 0,
+        "tester": 0,
+    }
+    _OPENHANDS_OPTIONAL_ROLES_BY_STEP = {
+        "router": set(),
+        "planner": set(),
+        "coder": {"router"},
+        "reviewer": set(),
+        "tester": set(),
+    }
+
     def __init__(
         self,
         *,
@@ -3794,50 +3877,44 @@ class _OpenHandsPromptBackedMixin:
         step_name: str,
         segments: Sequence[Mapping[str, object]],
     ) -> List[str]:
-        request_segment_ids: List[str] = []
-        evidence_budget_by_step = {
-            "router": 1,
-            "planner": 2,
-            "coder": 1,
-            "reviewer": 0,
-            "tester": 0,
-        }
-        evidence_budget = evidence_budget_by_step.get(step_name, 0)
-        evidence_count = 0
+        mandatory_roles = self._OPENHANDS_MANDATORY_ROLES_BY_STEP.get(step_name, set())
+        evidence_budget = self._OPENHANDS_EVIDENCE_TOKEN_BUDGET_BY_STEP.get(step_name, 0)
+        optional_roles = self._OPENHANDS_OPTIONAL_ROLES_BY_STEP.get(step_name, set())
 
-        for segment in segments:
+        selected_ids: set[str] = set()
+        evidence_candidates: List[tuple[int, int, int, str]] = []
+
+        for index, segment in enumerate(segments):
             state_id = str(segment["state_id"])
             role = str(segment.get("segment_role", "")).lower()
-
-            include = False
             if role == "system":
-                include = False
-            elif step_name == "router":
-                include = role in {"task", "scratchpad"}
-            elif step_name == "planner":
-                include = role in {"task", "router", "scratchpad"}
-            elif step_name == "coder":
-                include = role in {"task", "plan"}
-            elif step_name == "reviewer":
-                include = role in {"task", "plan", "artifact"}
-            elif step_name == "tester":
-                include = role in {"task", "artifact", "review"}
-            else:
-                include = super()._should_include_request_segment(
-                    step_name=step_name,
-                    role=role,
-                    state_id=state_id,
-                    segment=segment,
-                )
-
+                continue
+            if role in mandatory_roles:
+                selected_ids.add(state_id)
+                continue
             if role == "evidence":
-                if evidence_count < evidence_budget:
-                    include = True
-                    evidence_count += 1
-                else:
-                    include = False
+                token_count = max(1, int(segment.get("token_count") or 0))
+                retrieval_priority = 0 if state_id.startswith("retrieval_") else 1
+                evidence_candidates.append(
+                    (retrieval_priority, token_count, index, state_id)
+                )
+                continue
+            if role in optional_roles:
+                selected_ids.add(state_id)
 
-            if include:
+        if evidence_budget > 0 and evidence_candidates:
+            remaining_budget = evidence_budget
+            chosen_evidence_ids: set[str] = set()
+            for _, token_count, _, state_id in sorted(evidence_candidates):
+                if token_count <= remaining_budget or not chosen_evidence_ids:
+                    chosen_evidence_ids.add(state_id)
+                    remaining_budget = max(0, remaining_budget - token_count)
+            selected_ids.update(chosen_evidence_ids)
+
+        request_segment_ids: List[str] = []
+        for segment in segments:
+            state_id = str(segment["state_id"])
+            if state_id in selected_ids:
                 request_segment_ids.append(state_id)
         return request_segment_ids
 
@@ -5223,6 +5300,16 @@ class LangGraphTracedAgentRunner(TracedAgentRunner):
                     self._segment(str(state["current_route_id"]), "summary", role="router"),
                     self._segment(str(state["current_plan_id"]), "plan", role="plan", update_cause="plan_update"),
                 ]
+                current_patch_id = state.get("current_patch_id")
+                if current_patch_id is not None:
+                    coder_segments.append(
+                        self._segment(
+                            str(current_patch_id),
+                            "artifact",
+                            role="artifact",
+                            update_cause="patch_update",
+                        )
+                    )
                 coder_segments.extend(
                     self._segment(doc.state_id, "evidence", role="evidence")
                     for doc in readme_states

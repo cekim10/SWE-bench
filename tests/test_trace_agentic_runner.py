@@ -654,27 +654,27 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 {"state_id": "review_v1", "segment_role": "review"},
             ]
             planner_segments = [
-                {"state_id": "system_v1", "segment_role": "system"},
-                {"state_id": "task_v1", "segment_role": "task"},
-                {"state_id": "route_v1", "segment_role": "router"},
-                {"state_id": "readme_1", "segment_role": "evidence"},
-                {"state_id": "retrieval_1", "segment_role": "evidence"},
-                {"state_id": "retrieval_2", "segment_role": "evidence"},
+                {"state_id": "system_v1", "segment_role": "system", "token_count": 20},
+                {"state_id": "task_v1", "segment_role": "task", "token_count": 40},
+                {"state_id": "route_v1", "segment_role": "router", "token_count": 24},
+                {"state_id": "readme_1", "segment_role": "evidence", "token_count": 1200},
+                {"state_id": "retrieval_1", "segment_role": "evidence", "token_count": 250},
+                {"state_id": "retrieval_2", "segment_role": "evidence", "token_count": 300},
             ]
             coder_segments = [
-                {"state_id": "system_v1", "segment_role": "system"},
-                {"state_id": "task_v1", "segment_role": "task"},
-                {"state_id": "route_v1", "segment_role": "router"},
-                {"state_id": "plan_v1", "segment_role": "plan"},
-                {"state_id": "readme_1", "segment_role": "evidence"},
-                {"state_id": "retrieval_1", "segment_role": "evidence"},
-                {"state_id": "patch_v1", "segment_role": "artifact"},
+                {"state_id": "system_v1", "segment_role": "system", "token_count": 20},
+                {"state_id": "task_v1", "segment_role": "task", "token_count": 40},
+                {"state_id": "route_v1", "segment_role": "router", "token_count": 24},
+                {"state_id": "plan_v1", "segment_role": "plan", "token_count": 36},
+                {"state_id": "readme_1", "segment_role": "evidence", "token_count": 1200},
+                {"state_id": "retrieval_1", "segment_role": "evidence", "token_count": 250},
+                {"state_id": "patch_v1", "segment_role": "artifact", "token_count": 80},
             ]
             tester_segments = [
-                {"state_id": "system_v1", "segment_role": "system"},
-                {"state_id": "task_v1", "segment_role": "task"},
-                {"state_id": "patch_v1", "segment_role": "artifact"},
-                {"state_id": "review_v1", "segment_role": "review"},
+                {"state_id": "system_v1", "segment_role": "system", "token_count": 20},
+                {"state_id": "task_v1", "segment_role": "task", "token_count": 40},
+                {"state_id": "patch_v1", "segment_role": "artifact", "token_count": 80},
+                {"state_id": "review_v1", "segment_role": "review", "token_count": 32},
             ]
 
             planner_request_ids = runner._request_segment_ids_for_step(
@@ -696,11 +696,11 @@ class TraceAgenticRunnerTests(unittest.TestCase):
 
             self.assertEqual(
                 planner_request_ids,
-                ["task_v1", "route_v1", "readme_1", "retrieval_1"],
+                ["task_v1", "route_v1", "retrieval_1", "retrieval_2"],
             )
             self.assertEqual(
                 coder_request_ids,
-                ["task_v1", "plan_v1", "readme_1"],
+                ["task_v1", "route_v1", "plan_v1", "retrieval_1", "patch_v1"],
             )
             self.assertEqual(reviewer_request_ids, ["task_v1", "plan_v1", "patch_v1"])
             self.assertEqual(tester_request_ids, ["task_v1", "patch_v1", "review_v1"])
