@@ -515,12 +515,27 @@ def load_openhands_prompt_pack(
             "--openhands_path, or place it at './.external/openhands'."
         )
 
-    config_path = resolved_repo_path / "config.template.toml"
+    config_candidates = [
+        resolved_repo_path / "config.template.toml",
+        resolved_repo_path / "config.toml",
+    ]
+    config_path = next((path for path in config_candidates if path.exists()), None)
     agents_path = resolved_repo_path / "AGENTS.md"
-    codeact_agent_path = (
-        resolved_repo_path / "openhands" / "agenthub" / "codeact_agent" / "codeact_agent.py"
-    )
-    if not config_path.exists() or not agents_path.exists() or not codeact_agent_path.exists():
+    codeact_candidates = [
+        resolved_repo_path / "openhands" / "agenthub" / "codeact_agent" / "codeact_agent.py",
+        resolved_repo_path / "openhands" / "agenthub" / "codeact_agent" / "agent.py",
+    ]
+    codeact_agent_path = next((path for path in codeact_candidates if path.exists()), None)
+    if codeact_agent_path is None:
+        codeact_agent_path = next(
+            (
+                path
+                for path in resolved_repo_path.rglob("codeact_agent.py")
+                if ".venv" not in path.parts
+            ),
+            None,
+        )
+    if config_path is None or codeact_agent_path is None:
         raise RuntimeError(
             f"{resolved_repo_path} does not look like an OpenHands/openhands checkout"
         )
@@ -539,10 +554,14 @@ def load_openhands_prompt_pack(
     return OpenHandsPromptPack(
         repo_path=resolved_repo_path,
         config_path=config_path,
-        agents_path=agents_path,
+        agents_path=agents_path if agents_path.exists() else resolved_repo_path,
         codeact_agent_path=codeact_agent_path,
         default_agent_name=default_agent_name,
-        agents_guidance=agents_path.read_text(encoding="utf-8"),
+        agents_guidance=(
+            agents_path.read_text(encoding="utf-8")
+            if agents_path.exists()
+            else "OpenHands repository guidance file AGENTS.md was not present in this checkout."
+        ),
         development_guidance=development_guidance,
     )
 
