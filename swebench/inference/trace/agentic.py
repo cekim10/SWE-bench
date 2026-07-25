@@ -521,6 +521,7 @@ def load_openhands_prompt_pack(
     ]
     config_path = next((path for path in config_candidates if path.exists()), None)
     agents_path = resolved_repo_path / "AGENTS.md"
+    development_path = resolved_repo_path / "Development.md"
     codeact_candidates = [
         resolved_repo_path / "openhands" / "agenthub" / "codeact_agent" / "codeact_agent.py",
         resolved_repo_path / "openhands" / "agenthub" / "codeact_agent" / "agent.py",
@@ -535,25 +536,29 @@ def load_openhands_prompt_pack(
             ),
             None,
         )
-    if config_path is None or codeact_agent_path is None:
+    if config_path is None and not agents_path.exists() and not development_path.exists():
         raise RuntimeError(
             f"{resolved_repo_path} does not look like an OpenHands/openhands checkout"
         )
-
-    config_source = config_path.read_text(encoding="utf-8")
-    default_agent_name = (
-        _extract_toml_string_assignment(config_source, "default_agent")
-        or "CodeActAgent"
-    )
-    development_path = resolved_repo_path / "Development.md"
     development_guidance = (
         development_path.read_text(encoding="utf-8")
         if development_path.exists()
         else ""
     )
+    config_source = (
+        config_path.read_text(encoding="utf-8")
+        if config_path is not None
+        else ""
+    )
+    default_agent_name = (
+        _extract_toml_string_assignment(config_source, "default_agent")
+        or "CodeActAgent"
+    )
+    if codeact_agent_path is None:
+        codeact_agent_path = resolved_repo_path
     return OpenHandsPromptPack(
         repo_path=resolved_repo_path,
-        config_path=config_path,
+        config_path=config_path if config_path is not None else resolved_repo_path,
         agents_path=agents_path if agents_path.exists() else resolved_repo_path,
         codeact_agent_path=codeact_agent_path,
         default_agent_name=default_agent_name,
