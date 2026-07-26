@@ -1551,6 +1551,7 @@ class TracedAgentRunner:
             state_id=handle.state_id,
             identity=SegmentIdentity(logical_key=handle.logical_key, module=module),
             version=handle.version,
+            role=role,
             size_bytes=size_bytes(text),
             token_count=approx_token_count(text),
             workflow_id=workflow_id,

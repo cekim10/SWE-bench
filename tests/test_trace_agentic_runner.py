@@ -111,6 +111,39 @@ class TraceAgenticRunnerTests(unittest.TestCase):
             self.assertEqual(events[0]["ts"], 0)
             self.assertEqual(events[-1]["ts"], len(events) - 1)
 
+    def test_register_runtime_segment_preserves_explicit_role(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = AGENTIC.TracedAgentRunner(
+                backend=AGENTIC.StubModelBackend(),
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                prompt_runtime_mode="segment_aware",
+            )
+            materializer = AGENTIC.SegmentRuntime()
+            handle = types.SimpleNamespace(
+                state_id="task_v1",
+                logical_key="prompt/task",
+                version=1,
+            )
+
+            runner._register_runtime_segment(
+                materializer=materializer,
+                handle=handle,
+                workflow_id="wf",
+                module="task",
+                role="task",
+                text="Fix bug #123",
+                materialization="HBM",
+                is_shared=True,
+                is_immutable=True,
+                is_ephemeral=False,
+            )
+
+            self.assertEqual(
+                runner._runtime_segment_cache["task_v1"].role.value,
+                "task",
+            )
+
     def test_validate_trace_flags_missing_prompt_reads(self):
         report = AGENTIC.validate_trace_events(
             [
