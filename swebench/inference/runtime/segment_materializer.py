@@ -284,6 +284,9 @@ class RuntimeEvent:
     reason: str | None
     size_bytes: int
     token_count: int
+    request_id: str | None = None
+    step_name: str | None = None
+    iteration: int | None = None
 
 
 @dataclass(frozen=True)
@@ -548,6 +551,7 @@ class SegmentRuntime:
         self._current_segment_id_by_logical_id: Dict[str, str] = {}
         self._events: list[RuntimeEvent] = []
         self._hbm_budget_bytes = hbm_budget_bytes
+        self._active_request_metadata: Dict[str, object] | None = None
         self._reclaim_grace_by_role = {
             _normalize_role(role): float(grace)
             for role, grace in (reclaim_grace_by_role or {}).items()
@@ -591,6 +595,24 @@ class SegmentRuntime:
                 reason=reason,
                 size_bytes=segment.size_bytes,
                 token_count=segment.token_count,
+                request_id=(
+                    str(self._active_request_metadata.get("request_id"))
+                    if self._active_request_metadata is not None
+                    and self._active_request_metadata.get("request_id") is not None
+                    else None
+                ),
+                step_name=(
+                    str(self._active_request_metadata.get("step_name"))
+                    if self._active_request_metadata is not None
+                    and self._active_request_metadata.get("step_name") is not None
+                    else None
+                ),
+                iteration=(
+                    int(self._active_request_metadata.get("iteration"))
+                    if self._active_request_metadata is not None
+                    and self._active_request_metadata.get("iteration") is not None
+                    else None
+                ),
             )
         )
 
@@ -1176,26 +1198,35 @@ class SegmentRuntime:
         model_id: str = "group-model",
         tokenizer_id: str = "group-tokenizer",
         inference_config: Mapping[str, object] | None = None,
+        request_metadata: Mapping[str, object] | None = None,
     ) -> RuntimePlacementDecision:
         self.reclaim_expired()
         policy = policy or ReuseAwareRuntimePolicy()
-        decision = policy.decide(runtime=self, group=group)
-        self.apply_decision(decision)
-        for state_id in group.ordered_segment_ids:
-            lookup_result = self.lookup(
-                state_id,
-                self.execution_context_for_group(
-                    group=group,
-                    state_id=state_id,
-                    model_id=model_id,
-                    tokenizer_id=tokenizer_id,
-                    inference_config=inference_config,
-                ),
-            )
-            if isinstance(lookup_result, LookupResult) and lookup_result.status == LookupStatus.INVALID:
-                raise InvalidLookupError(
-                    f"invalid grouped lookup for {state_id!r}: {lookup_result.reason}"
+        previous_request_metadata = self._active_request_metadata
+        self._active_request_metadata = dict(request_metadata or {})
+        try:
+            decision = policy.decide(runtime=self, group=group)
+            self.apply_decision(decision)
+            for state_id in group.ordered_segment_ids:
+                lookup_result = self.lookup(
+                    state_id,
+                    self.execution_context_for_group(
+                        group=group,
+                        state_id=state_id,
+                        model_id=model_id,
+                        tokenizer_id=tokenizer_id,
+                        inference_config=inference_config,
+                    ),
                 )
+                if (
+                    isinstance(lookup_result, LookupResult)
+                    and lookup_result.status == LookupStatus.INVALID
+                ):
+                    raise InvalidLookupError(
+                        f"invalid grouped lookup for {state_id!r}: {lookup_result.reason}"
+                    )
+        finally:
+            self._active_request_metadata = previous_request_metadata
         return decision
 
     def build_vllm_request(

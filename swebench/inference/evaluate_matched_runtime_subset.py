@@ -211,6 +211,10 @@ def build_matched_report(
                 - right_runtime["lifecycle_reclaims"],
                 "policy_reclaims": left_runtime["policy_reclaims"]
                 - right_runtime["policy_reclaims"],
+                "same_request_reuse_then_materialize_count": left_runtime.get(
+                    "same_request_reuse_then_materialize_count", 0
+                )
+                - right_runtime.get("same_request_reuse_then_materialize_count", 0),
             }
         )
     if left_latency is not None and right_latency is not None:
@@ -233,8 +237,20 @@ def build_matched_report(
                     "duration_ms_per_1k_prompt_tokens"
                 ]
                 - right_latency["duration_ms_per_1k_prompt_tokens"],
+                "request_count": left_latency["request_count"]
+                - right_latency["request_count"],
+                "iteration_count": left_latency.get("iteration_count", 0)
+                - right_latency.get("iteration_count", 0),
+                "avg_requests_per_iteration": left_latency.get(
+                    "avg_requests_per_iteration", 0.0
+                )
+                - right_latency.get("avg_requests_per_iteration", 0.0),
                 "total_prompt_tokens": left_latency["total_prompt_tokens"]
                 - right_latency["total_prompt_tokens"],
+                "total_completion_tokens": left_latency["total_completion_tokens"]
+                - right_latency["total_completion_tokens"],
+                "avg_completion_tokens": left_latency.get("avg_completion_tokens", 0.0)
+                - right_latency.get("avg_completion_tokens", 0.0),
                 "total_prompt_payload_tokens_estimate": left_latency[
                     "total_prompt_payload_tokens_estimate"
                 ]
@@ -428,6 +444,21 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
 
     if left_latency is not None and right_latency is not None:
         latency_rows = [
+            (
+                "Requests",
+                left_latency.get("request_count", 0),
+                right_latency.get("request_count", 0),
+            ),
+            (
+                "Iterations",
+                left_latency.get("iteration_count", 0),
+                right_latency.get("iteration_count", 0),
+            ),
+            (
+                "Avg requests / iteration",
+                left_latency.get("avg_requests_per_iteration", 0.0),
+                right_latency.get("avg_requests_per_iteration", 0.0),
+            ),
             ("Avg duration ms", left_latency["avg_duration_ms"], right_latency["avg_duration_ms"]),
             (
                 "Avg backend round-trip ms",
@@ -445,6 +476,16 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
                 right_latency["duration_ms_per_1k_prompt_tokens"],
             ),
             ("Total prompt tokens", left_latency["total_prompt_tokens"], right_latency["total_prompt_tokens"]),
+            (
+                "Total completion tokens",
+                left_latency.get("total_completion_tokens", 0),
+                right_latency.get("total_completion_tokens", 0),
+            ),
+            (
+                "Avg completion tokens / request",
+                left_latency.get("avg_completion_tokens", 0.0),
+                right_latency.get("avg_completion_tokens", 0.0),
+            ),
             (
                 "Prompt payload tokens (est.)",
                 left_latency["total_prompt_payload_tokens_estimate"],

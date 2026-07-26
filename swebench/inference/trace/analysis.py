@@ -336,8 +336,11 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
     role_counts: Dict[str, Dict[str, float | int | str]] = {}
     workflow_counts: Dict[str, Dict[str, float | int | str]] = {}
     execution_context_counts: Dict[str, Dict[str, float | int | str]] = {}
+    request_counts: Dict[str, Dict[str, object]] = {}
     segment_stats: Dict[str, Dict[str, object]] = {}
     last_timestamp = max(float(event.get("timestamp", 0.0)) for event in events)
+    same_request_reuse_then_materialize_keys: set[tuple[str, str, int, str]] = set()
+    seen_reuse_keys: set[tuple[str, str, int, str]] = set()
 
     lifecycle_reasons = {
         "release_reclamation",
@@ -476,6 +479,21 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
             segment["released_at"] = timestamp
 
         execution_context_digest = event.get("execution_context_digest")
+        request_id = (
+            str(event.get("request_id"))
+            if event.get("request_id") is not None
+            else None
+        )
+        step_name = (
+            str(event.get("step_name"))
+            if event.get("step_name") is not None
+            else "unknown"
+        )
+        iteration = (
+            int(event.get("iteration"))
+            if event.get("iteration") is not None
+            else None
+        )
         if execution_context_digest:
             digest = str(execution_context_digest)
             if digest not in execution_context_counts:
@@ -503,6 +521,44 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
                     execution_bucket["rematerializations"] = int(
                         execution_bucket["rematerializations"]
                     ) + 1
+        if request_id is not None:
+            if request_id not in request_counts:
+                request_counts[request_id] = {
+                    "request_id": request_id,
+                    "workflow_id": workflow_id,
+                    "step_name": step_name,
+                    "iteration": iteration,
+                    "resident_hits": 0,
+                    "evicted_hits": 0,
+                    "misses": 0,
+                    "invalid_lookups": 0,
+                    "materializations": 0,
+                    "reuse_count": 0,
+                }
+            request_bucket = request_counts[request_id]
+            if status == "HIT_RESIDENT":
+                request_bucket["resident_hits"] = int(request_bucket["resident_hits"]) + 1
+            elif status == "HIT_EVICTED":
+                request_bucket["evicted_hits"] = int(request_bucket["evicted_hits"]) + 1
+            elif status == "MISS":
+                request_bucket["misses"] = int(request_bucket["misses"]) + 1
+            elif status == "INVALID":
+                request_bucket["invalid_lookups"] = int(request_bucket["invalid_lookups"]) + 1
+            if operation == "REUSE":
+                request_bucket["reuse_count"] = int(request_bucket["reuse_count"]) + 1
+            elif operation == "MATERIALIZE_INTERNAL":
+                request_bucket["materializations"] = int(request_bucket["materializations"]) + 1
+            if execution_context_digest:
+                context_key = (
+                    request_id,
+                    str(event.get("segment_id", "unknown")),
+                    int(event.get("version", 0)),
+                    str(execution_context_digest),
+                )
+                if operation == "REUSE":
+                    seen_reuse_keys.add(context_key)
+                elif operation == "MATERIALIZE_INTERNAL" and context_key in seen_reuse_keys:
+                    same_request_reuse_then_materialize_keys.add(context_key)
 
     role_segment_map: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     for segment in segment_stats.values():
@@ -753,6 +809,18 @@ def analyze_runtime_events(events: Sequence[Mapping[str, object]]) -> Dict[str, 
                 str(item["execution_context_digest"]),
             ),
         ),
+        "request_rows": sorted(
+            request_counts.values(),
+            key=lambda item: (
+                str(item["workflow_id"]),
+                str(item["step_name"]),
+                int(item["iteration"] or 0),
+                str(item["request_id"]),
+            ),
+        ),
+        "same_request_reuse_then_materialize_count": len(
+            same_request_reuse_then_materialize_keys
+        ),
     }
 
 
@@ -780,6 +848,11 @@ def analyze_backend_call_records(
         int(record.get("completion_tokens") or 0) for record in records
     )
     total_tokens = sum(int(record.get("total_tokens") or 0) for record in records)
+    iteration_values = {
+        int(record.get("iteration"))
+        for record in records
+        if record.get("iteration") is not None
+    }
     frontend_cache_hits = sum(
         1 for record in records if bool(record.get("frontend_cache_hit", False))
     )
@@ -922,6 +995,13 @@ def analyze_backend_call_records(
                 "step_name": step_name,
                 "prompt_mode": prompt_mode,
                 "request_count": len(step_records),
+                "iteration_count": len(
+                    {
+                        int(record.get("iteration"))
+                        for record in step_records
+                        if record.get("iteration") is not None
+                    }
+                ),
                 "total_duration_ms": step_duration_ms,
                 "avg_duration_ms": step_duration_ms / len(step_records),
                 "total_backend_roundtrip_ms": step_backend_roundtrip_ms,
@@ -938,8 +1018,16 @@ def analyze_backend_call_records(
                 "total_prompt_tokens": step_prompt_tokens,
                 "total_completion_tokens": step_completion_tokens,
                 "total_tokens": step_total_tokens,
+                "avg_completion_tokens": (
+                    step_completion_tokens / len(step_records)
+                    if step_records
+                    else 0.0
+                ),
                 "avg_prompt_tokens": (
                     step_prompt_tokens / len(step_records) if step_records else 0.0
+                ),
+                "avg_total_tokens": (
+                    step_total_tokens / len(step_records) if step_records else 0.0
                 ),
                 "duration_ms_per_1k_prompt_tokens": (
                     step_duration_ms / (step_prompt_tokens / 1000.0)
@@ -977,6 +1065,10 @@ def analyze_backend_call_records(
 
     return {
         "request_count": len(records),
+        "iteration_count": len(iteration_values),
+        "avg_requests_per_iteration": (
+            len(records) / len(iteration_values) if iteration_values else 0.0
+        ),
         "total_duration_ms": total_duration_ms,
         "avg_duration_ms": total_duration_ms / len(records),
         "total_backend_roundtrip_ms": total_backend_roundtrip_ms,
@@ -991,6 +1083,8 @@ def analyze_backend_call_records(
         "total_completion_tokens": total_completion_tokens,
         "total_tokens": total_tokens,
         "avg_prompt_tokens": total_prompt_tokens / len(records),
+        "avg_completion_tokens": total_completion_tokens / len(records),
+        "avg_total_tokens": total_tokens / len(records),
         "duration_ms_per_1k_prompt_tokens": (
             total_duration_ms / (total_prompt_tokens / 1000.0)
             if total_prompt_tokens
@@ -1307,6 +1401,7 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Token-weighted reuse rate: {runtime_behavior['token_weighted_reuse_rate']:.2f}",
                 f"- Reuse benefit ratio: {reuse_benefit_ratio:.2f}",
                 f"- Prompt-token reuse fraction: {prompt_token_reuse_fraction:.2f}",
+                f"- Same-request reuse->materialize count: {runtime_behavior.get('same_request_reuse_then_materialize_count', 0)}",
                 f"- Lifecycle reclaims: {runtime_behavior['lifecycle_reclaims']}",
                 f"- Policy reclaims: {runtime_behavior['policy_reclaims']}",
                 f"- Bytes reclaimed: {runtime_behavior['bytes_reclaimed']}",
@@ -1349,6 +1444,8 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 "## Request Latency",
                 "",
                 f"- Requests: {backend_latency['request_count']}",
+                f"- Iterations: {backend_latency.get('iteration_count', 0)}",
+                f"- Avg requests / iteration: {backend_latency.get('avg_requests_per_iteration', 0.0):.2f}",
                 f"- Total duration ms: {backend_latency['total_duration_ms']:.2f}",
                 f"- Average duration ms: {backend_latency['avg_duration_ms']:.2f}",
                 f"- Backend round-trip ms: {backend_latency['total_backend_roundtrip_ms']:.2f}",
@@ -1357,6 +1454,7 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                 f"- Frontend overhead ms: {backend_latency['total_frontend_overhead_ms']:.2f}",
                 f"- Total prompt tokens: {backend_latency['total_prompt_tokens']}",
                 f"- Total completion tokens: {backend_latency['total_completion_tokens']}",
+                f"- Avg completion tokens / request: {backend_latency.get('avg_completion_tokens', 0.0):.2f}",
                 f"- Avg prompt tokens / request: {backend_latency['avg_prompt_tokens']:.2f}",
                 f"- Duration ms per 1k prompt tokens: {backend_latency['duration_ms_per_1k_prompt_tokens']:.2f}",
                 f"- Frontend cache hit rate: {backend_latency['frontend_cache_hit_rate']:.2f}",
@@ -1859,6 +1957,8 @@ def _empty_runtime_behavior_summary() -> Dict[str, object]:
         "lifetime_rows": [],
         "segment_rows": [],
         "execution_context_rows": [],
+        "request_rows": [],
+        "same_request_reuse_then_materialize_count": 0,
     }
 
 
@@ -1876,6 +1976,8 @@ def _empty_reuse_locality_summary() -> Dict[str, object]:
 def _empty_backend_latency_summary() -> Dict[str, object]:
     return {
         "request_count": 0,
+        "iteration_count": 0,
+        "avg_requests_per_iteration": 0.0,
         "total_duration_ms": 0.0,
         "avg_duration_ms": 0.0,
         "total_backend_roundtrip_ms": 0.0,
@@ -1890,6 +1992,8 @@ def _empty_backend_latency_summary() -> Dict[str, object]:
         "total_completion_tokens": 0,
         "total_tokens": 0,
         "avg_prompt_tokens": 0.0,
+        "avg_completion_tokens": 0.0,
+        "avg_total_tokens": 0.0,
         "duration_ms_per_1k_prompt_tokens": 0.0,
         "frontend_cache_hits": 0,
         "frontend_cache_hit_rate": 0.0,
@@ -2245,6 +2349,14 @@ def _aggregate_runtime_behaviors(
     reused_tokens = sum(int(row["reused_tokens"]) for row in finalized_role_rows)
     materialized_tokens = sum(int(row["materialized_tokens"]) for row in finalized_role_rows)
     rematerialized_tokens = sum(int(row["rematerialized_tokens"]) for row in finalized_role_rows)
+    request_rows: Dict[str, Dict[str, object]] = {}
+    same_request_reuse_then_materialize_count = 0
+    for behavior in runtime_behaviors:
+        same_request_reuse_then_materialize_count += int(
+            behavior.get("same_request_reuse_then_materialize_count", 0)
+        )
+        for row in behavior.get("request_rows", []):
+            request_rows[str(row["request_id"])] = dict(row)
 
     return {
         "event_count": sum(int(behavior["event_count"]) for behavior in runtime_behaviors),
@@ -2298,6 +2410,16 @@ def _aggregate_runtime_behaviors(
         "lifetime_rows": finalized_lifetime_rows,
         "segment_rows": [],
         "execution_context_rows": [],
+        "request_rows": sorted(
+            request_rows.values(),
+            key=lambda row: (
+                str(row["workflow_id"]),
+                str(row["step_name"]),
+                int(row["iteration"] or 0),
+                str(row["request_id"]),
+            ),
+        ),
+        "same_request_reuse_then_materialize_count": same_request_reuse_then_materialize_count,
     }
 
 

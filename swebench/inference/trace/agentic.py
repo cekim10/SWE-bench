@@ -802,6 +802,10 @@ class StubModelBackend:
         total_duration_ms = (time.perf_counter() - call_started_at) * 1000.0
         self._call_records.append(
             {
+                "request_id": (
+                    prompt_group.group_id if prompt_group is not None else f"{step_name}-{iteration}"
+                ),
+                "iteration": iteration,
                 "step_name": step_name,
                 "prompt_mode": prompt_mode,
                 "duration_ms": total_duration_ms,
@@ -1138,6 +1142,10 @@ class VLLMServerChatBackend:
         total_duration_ms = (time.perf_counter() - call_started_at) * 1000.0
         self._call_records.append(
             {
+                "request_id": (
+                    prompt_group.group_id if prompt_group is not None else f"{step_name}-{iteration}"
+                ),
+                "iteration": iteration,
                 "step_name": step_name,
                 "prompt_mode": prompt_mode,
                 "duration_ms": total_duration_ms,
@@ -1715,6 +1723,11 @@ class TracedAgentRunner:
                 step_name=step_name,
                 prompt_mode="monolithic",
             ),
+            request_metadata={
+                "request_id": prompt_id,
+                "step_name": step_name,
+                "iteration": metadata.get("iteration") if metadata is not None else None,
+            },
         )
         snapshot = materializer.snapshot()
         flattened_ordered_segments = tuple(
@@ -1795,6 +1808,11 @@ class TracedAgentRunner:
                 step_name=step_name,
                 prompt_mode="segment_aware",
             ),
+            request_metadata={
+                "request_id": prompt_id,
+                "step_name": step_name,
+                "iteration": metadata.get("iteration") if metadata is not None else None,
+            },
         )
         snapshot = materializer.snapshot()
         trace.log_prompt_segments(
@@ -1918,6 +1936,9 @@ class TracedAgentRunner:
                     "to_residency_state": event.to_residency_state,
                     "lookup_status": event.lookup_status,
                     "execution_context_digest": event.execution_context_digest,
+                    "request_id": event.request_id,
+                    "step_name": event.step_name,
+                    "iteration": event.iteration,
                     "reason": event.reason,
                     "size_bytes": event.size_bytes,
                     "token_count": segment.token_count,
@@ -1933,6 +1954,8 @@ class TracedAgentRunner:
         if not call_records:
             return {
                 "request_count": 0,
+                "iteration_count": 0,
+                "avg_requests_per_iteration": 0.0,
                 "total_duration_ms": 0.0,
                 "avg_duration_ms": 0.0,
                 "total_backend_roundtrip_ms": 0.0,
@@ -1947,6 +1970,8 @@ class TracedAgentRunner:
                 "total_completion_tokens": 0,
                 "total_tokens": 0,
                 "avg_prompt_tokens": 0.0,
+                "avg_completion_tokens": 0.0,
+                "avg_total_tokens": 0.0,
                 "duration_ms_per_1k_prompt_tokens": 0.0,
                 "frontend_cache_hits": 0,
                 "frontend_cache_hit_rate": 0.0,
@@ -1983,6 +2008,11 @@ class TracedAgentRunner:
             int(record.get("completion_tokens") or 0) for record in call_records
         )
         total_tokens = sum(int(record.get("total_tokens") or 0) for record in call_records)
+        iteration_values = {
+            int(record.get("iteration"))
+            for record in call_records
+            if record.get("iteration") is not None
+        }
         frontend_cache_hits = sum(
             1 for record in call_records if bool(record.get("frontend_cache_hit", False))
         )
@@ -2115,6 +2145,13 @@ class TracedAgentRunner:
                     "step_name": step_name,
                     "prompt_mode": prompt_mode,
                     "request_count": len(rows),
+                    "iteration_count": len(
+                        {
+                            int(row.get("iteration"))
+                            for row in rows
+                            if row.get("iteration") is not None
+                        }
+                    ),
                     "total_duration_ms": step_duration_ms,
                     "avg_duration_ms": step_duration_ms / len(rows),
                     "total_backend_roundtrip_ms": step_backend_roundtrip_ms,
@@ -2129,8 +2166,16 @@ class TracedAgentRunner:
                     "avg_frontend_overhead_ms": step_frontend_overhead_ms / len(rows),
                     "total_prompt_tokens": step_prompt_tokens,
                     "total_completion_tokens": step_completion_tokens,
+                    "avg_completion_tokens": (
+                        step_completion_tokens / len(rows) if rows else 0.0
+                    ),
                     "avg_prompt_tokens": (
                         step_prompt_tokens / len(rows) if rows else 0.0
+                    ),
+                    "avg_total_tokens": (
+                        (step_prompt_tokens + step_completion_tokens) / len(rows)
+                        if rows
+                        else 0.0
                     ),
                     "duration_ms_per_1k_prompt_tokens": (
                         step_duration_ms / (step_prompt_tokens / 1000.0)
@@ -2168,6 +2213,10 @@ class TracedAgentRunner:
 
         return {
             "request_count": len(call_records),
+            "iteration_count": len(iteration_values),
+            "avg_requests_per_iteration": (
+                len(call_records) / len(iteration_values) if iteration_values else 0.0
+            ),
             "total_duration_ms": total_duration_ms,
             "avg_duration_ms": total_duration_ms / len(call_records),
             "total_backend_roundtrip_ms": total_backend_roundtrip_ms,
@@ -2186,6 +2235,8 @@ class TracedAgentRunner:
             "total_completion_tokens": total_completion_tokens,
             "total_tokens": total_tokens,
             "avg_prompt_tokens": total_prompt_tokens / len(call_records),
+            "avg_completion_tokens": total_completion_tokens / len(call_records),
+            "avg_total_tokens": total_tokens / len(call_records),
             "duration_ms_per_1k_prompt_tokens": (
                 total_duration_ms / (total_prompt_tokens / 1000.0)
                 if total_prompt_tokens
