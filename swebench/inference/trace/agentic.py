@@ -3642,26 +3642,122 @@ class _OpenSWEAgentPromptBackedMixin:
 
 
 class _OpenHandsPromptBackedMixin:
-    _OPENHANDS_MANDATORY_ROLES_BY_STEP = {
-        "router": {"task", "scratchpad"},
-        "planner": {"task", "router", "scratchpad"},
-        "coder": {"task", "plan", "artifact"},
-        "reviewer": {"task", "plan", "artifact"},
-        "tester": {"task", "artifact", "review"},
-    }
-    _OPENHANDS_EVIDENCE_TOKEN_BUDGET_BY_STEP = {
-        "router": 900,
-        "planner": 1400,
-        "coder": 900,
-        "reviewer": 0,
-        "tester": 0,
-    }
-    _OPENHANDS_OPTIONAL_ROLES_BY_STEP = {
-        "router": set(),
-        "planner": set(),
-        "coder": {"router"},
-        "reviewer": set(),
-        "tester": set(),
+    _OPENHANDS_REQUEST_SELECTION_PROFILES = {
+        "default": {
+            "mandatory_roles_by_step": {
+                "router": {"task", "scratchpad"},
+                "planner": {"task", "router", "scratchpad"},
+                "coder": {"task", "plan", "artifact"},
+                "reviewer": {"task", "plan", "artifact"},
+                "tester": {"task", "artifact", "review"},
+            },
+            "optional_roles_by_step": {
+                "router": set(),
+                "planner": set(),
+                "coder": {"router"},
+                "reviewer": set(),
+                "tester": set(),
+            },
+            "evidence_token_budget_by_step": {
+                "router": 900,
+                "planner": 1400,
+                "coder": 900,
+                "reviewer": 0,
+                "tester": 0,
+            },
+        },
+        "task_only": {
+            "mandatory_roles_by_step": {
+                "router": {"task", "scratchpad"},
+                "planner": {"task", "router", "scratchpad"},
+                "coder": {"task"},
+                "reviewer": {"task", "artifact"},
+                "tester": {"task", "artifact", "review"},
+            },
+            "optional_roles_by_step": {
+                "router": set(),
+                "planner": set(),
+                "coder": set(),
+                "reviewer": set(),
+                "tester": set(),
+            },
+            "evidence_token_budget_by_step": {
+                "router": 0,
+                "planner": 0,
+                "coder": 0,
+                "reviewer": 0,
+                "tester": 0,
+            },
+        },
+        "task_plan": {
+            "mandatory_roles_by_step": {
+                "router": {"task", "scratchpad"},
+                "planner": {"task", "router", "scratchpad"},
+                "coder": {"task", "plan"},
+                "reviewer": {"task", "plan", "artifact"},
+                "tester": {"task", "artifact", "review"},
+            },
+            "optional_roles_by_step": {
+                "router": set(),
+                "planner": set(),
+                "coder": set(),
+                "reviewer": set(),
+                "tester": set(),
+            },
+            "evidence_token_budget_by_step": {
+                "router": 0,
+                "planner": 0,
+                "coder": 0,
+                "reviewer": 0,
+                "tester": 0,
+            },
+        },
+        "task_plan_artifact": {
+            "mandatory_roles_by_step": {
+                "router": {"task", "scratchpad"},
+                "planner": {"task", "router", "scratchpad"},
+                "coder": {"task", "plan", "artifact"},
+                "reviewer": {"task", "plan", "artifact"},
+                "tester": {"task", "artifact", "review"},
+            },
+            "optional_roles_by_step": {
+                "router": set(),
+                "planner": set(),
+                "coder": set(),
+                "reviewer": set(),
+                "tester": set(),
+            },
+            "evidence_token_budget_by_step": {
+                "router": 0,
+                "planner": 0,
+                "coder": 0,
+                "reviewer": 0,
+                "tester": 0,
+            },
+        },
+        "task_plan_artifact_budgeted_evidence": {
+            "mandatory_roles_by_step": {
+                "router": {"task", "scratchpad"},
+                "planner": {"task", "router", "scratchpad"},
+                "coder": {"task", "plan", "artifact"},
+                "reviewer": {"task", "plan", "artifact"},
+                "tester": {"task", "artifact", "review"},
+            },
+            "optional_roles_by_step": {
+                "router": set(),
+                "planner": set(),
+                "coder": set(),
+                "reviewer": set(),
+                "tester": set(),
+            },
+            "evidence_token_budget_by_step": {
+                "router": 0,
+                "planner": 768,
+                "coder": 1024,
+                "reviewer": 256,
+                "tester": 256,
+            },
+        },
     }
 
     def __init__(
@@ -3674,6 +3770,7 @@ class _OpenHandsPromptBackedMixin:
         max_files: int = 5,
         prompt_runtime_mode: str = "monolithic",
         openhands_path: str | Path | None = None,
+        request_selection_profile: str = "default",
     ) -> None:
         super().__init__(
             backend=backend,
@@ -3683,7 +3780,16 @@ class _OpenHandsPromptBackedMixin:
             max_files=max_files,
             prompt_runtime_mode=prompt_runtime_mode,
         )
+        if request_selection_profile not in self._OPENHANDS_REQUEST_SELECTION_PROFILES:
+            valid_profiles = ", ".join(
+                sorted(self._OPENHANDS_REQUEST_SELECTION_PROFILES)
+            )
+            raise ValueError(
+                "unknown OpenHands request selection profile "
+                f"{request_selection_profile!r}; expected one of {valid_profiles}"
+            )
         self._openhands_prompts = load_openhands_prompt_pack(openhands_path)
+        self._openhands_request_selection_profile = request_selection_profile
 
     def _agent_family_name(self) -> str:
         return "openhands"
@@ -3693,6 +3799,7 @@ class _OpenHandsPromptBackedMixin:
             "workload_source": "openhands",
             "openhands_path": str(self._openhands_prompts.repo_path),
             "openhands_default_agent": self._openhands_prompts.default_agent_name,
+            "request_selection_profile": self._openhands_request_selection_profile,
         }
 
     def _openhands_working_dir(self, instance: WorkflowInstance) -> str:
@@ -3878,9 +3985,14 @@ class _OpenHandsPromptBackedMixin:
         step_name: str,
         segments: Sequence[Mapping[str, object]],
     ) -> List[str]:
-        mandatory_roles = self._OPENHANDS_MANDATORY_ROLES_BY_STEP.get(step_name, set())
-        evidence_budget = self._OPENHANDS_EVIDENCE_TOKEN_BUDGET_BY_STEP.get(step_name, 0)
-        optional_roles = self._OPENHANDS_OPTIONAL_ROLES_BY_STEP.get(step_name, set())
+        profile = self._OPENHANDS_REQUEST_SELECTION_PROFILES[
+            self._openhands_request_selection_profile
+        ]
+        mandatory_roles = profile["mandatory_roles_by_step"].get(step_name, set())
+        evidence_budget = int(
+            profile["evidence_token_budget_by_step"].get(step_name, 0)
+        )
+        optional_roles = profile["optional_roles_by_step"].get(step_name, set())
 
         selected_ids: set[str] = set()
         evidence_candidates: List[tuple[int, int, int, str]] = []

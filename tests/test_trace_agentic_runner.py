@@ -738,6 +738,72 @@ class TraceAgenticRunnerTests(unittest.TestCase):
             self.assertEqual(reviewer_request_ids, ["task_v1", "plan_v1", "patch_v1"])
             self.assertEqual(tester_request_ids, ["task_v1", "patch_v1", "review_v1"])
 
+    def test_openhands_request_selection_profiles_support_ablation_variants(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "openhands"
+            codeact_dir = repo_root / "openhands" / "agenthub" / "codeact_agent"
+            codeact_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "config.template.toml").write_text(
+                '#default_agent = "CodeActAgent"\n',
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text("guide\n", encoding="utf-8")
+            (codeact_dir / "codeact_agent.py").write_text(
+                "class CodeActAgent:\n    pass\n",
+                encoding="utf-8",
+            )
+
+            def make_runner(profile: str):
+                return AGENTIC.OpenHandsTracedAgentRunner(
+                    backend=AGENTIC.StubModelBackend(),
+                    trace_dir=Path(tmpdir) / f"traces_{profile}",
+                    tenant_id="test-tenant",
+                    max_iterations=2,
+                    max_files=2,
+                    prompt_runtime_mode="segment_aware",
+                    openhands_path=repo_root,
+                    request_selection_profile=profile,
+                )
+
+            coder_segments = [
+                {"state_id": "system_v1", "segment_role": "system", "token_count": 20},
+                {"state_id": "task_v1", "segment_role": "task", "token_count": 40},
+                {"state_id": "route_v1", "segment_role": "router", "token_count": 24},
+                {"state_id": "plan_v1", "segment_role": "plan", "token_count": 36},
+                {"state_id": "readme_1", "segment_role": "evidence", "token_count": 1200},
+                {"state_id": "retrieval_1", "segment_role": "evidence", "token_count": 250},
+                {"state_id": "patch_v1", "segment_role": "artifact", "token_count": 80},
+            ]
+
+            task_only_ids = make_runner("task_only")._request_segment_ids_for_step(
+                step_name="coder",
+                segments=coder_segments,
+            )
+            task_plan_ids = make_runner("task_plan")._request_segment_ids_for_step(
+                step_name="coder",
+                segments=coder_segments,
+            )
+            task_plan_artifact_ids = make_runner(
+                "task_plan_artifact"
+            )._request_segment_ids_for_step(
+                step_name="coder",
+                segments=coder_segments,
+            )
+            budgeted_ids = make_runner(
+                "task_plan_artifact_budgeted_evidence"
+            )._request_segment_ids_for_step(
+                step_name="coder",
+                segments=coder_segments,
+            )
+
+            self.assertEqual(task_only_ids, ["task_v1"])
+            self.assertEqual(task_plan_ids, ["task_v1", "plan_v1"])
+            self.assertEqual(task_plan_artifact_ids, ["task_v1", "plan_v1", "patch_v1"])
+            self.assertEqual(
+                budgeted_ids,
+                ["task_v1", "plan_v1", "retrieval_1", "patch_v1"],
+            )
+
     @unittest.skipUnless(importlib.util.find_spec("langgraph"), "langgraph not installed in this interpreter")
     def test_real_langgraph_runner_emits_router_and_reviewer_states(self):
         with tempfile.TemporaryDirectory() as tmpdir:

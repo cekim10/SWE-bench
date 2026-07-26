@@ -401,6 +401,11 @@ class TraceAnalysisTests(unittest.TestCase):
                 len(aggregate["runtime_behavior"]["role_rows"]),
                 0,
             )
+            self.assertIn("request_selection_utility", aggregate)
+            self.assertGreater(
+                len(aggregate["request_selection_utility"]["role_rows"]),
+                0,
+            )
 
     def test_markdown_render_contains_sections(self):
         report = {
@@ -625,6 +630,25 @@ class TraceAnalysisTests(unittest.TestCase):
                         }
                     ],
                 },
+                "request_selection_utility": {
+                    "total_payload_tokens": 24,
+                    "total_reused_tokens": 12,
+                    "overall_reuse_efficiency": 0.5,
+                    "overall_net_token_benefit": -12,
+                    "role_rows": [
+                        {
+                            "role": "TASK",
+                            "payload_tokens": 24,
+                            "reused_tokens": 12,
+                            "materialized_tokens": 48,
+                            "resident_hits": 1,
+                            "overlap_tokens": 4,
+                            "exact_duplicate_count": 0,
+                            "reuse_efficiency": 0.5,
+                            "net_token_benefit": -12,
+                        }
+                    ],
+                },
             },
             "run_summary": {
                 "record_count": 1,
@@ -659,6 +683,7 @@ class TraceAnalysisTests(unittest.TestCase):
         self.assertIn("## Practical Runtime", markdown)
         self.assertIn("offline oracle upper bound", markdown)
         self.assertIn("## Provider Breakdown", markdown)
+        self.assertIn("## Request Selection Utility", markdown)
         self.assertIn("Pinned live fraction", markdown)
         self.assertIn("Fragmentation loss", markdown)
         self.assertIn("Request-segment overlap ratio", markdown)

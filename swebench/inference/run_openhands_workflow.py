@@ -54,6 +54,20 @@ def parse_args():
             "'./.external/openhands'."
         ),
     )
+    parser.add_argument(
+        "--request_selection_profile",
+        choices=[
+            "default",
+            "task_only",
+            "task_plan",
+            "task_plan_artifact",
+            "task_plan_artifact_budgeted_evidence",
+        ],
+        default="default",
+        help=(
+            "OpenHands request-selection ablation profile for segment-aware runs."
+        ),
+    )
     args = parser.parse_args()
     if not args.demo_instance and not args.instances_path:
         parser.error("Provide either --demo_instance or --instances_path.")
@@ -81,6 +95,7 @@ def main():
         max_files=args.max_files,
         prompt_runtime_mode=args.prompt_runtime_mode,
         openhands_path=args.openhands_path,
+        request_selection_profile=args.request_selection_profile,
     )
 
     output_path = Path(args.output_path)

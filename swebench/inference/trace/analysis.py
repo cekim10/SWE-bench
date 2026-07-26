@@ -1408,6 +1408,32 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
                     f"{row['overlap_ratio']:.2f} | {row['exact_duplicate_count']} |"
                 )
 
+    request_selection_utility = aggregate.get("request_selection_utility")
+    if request_selection_utility is not None and request_selection_utility.get(
+        "role_rows"
+    ):
+        lines.extend(
+            [
+                "",
+                "## Request Selection Utility",
+                "",
+                f"- Total payload tokens: {request_selection_utility['total_payload_tokens']}",
+                f"- Total reused tokens: {request_selection_utility['total_reused_tokens']}",
+                f"- Overall reuse efficiency: {request_selection_utility['overall_reuse_efficiency']:.2f}",
+                f"- Overall net token benefit: {request_selection_utility['overall_net_token_benefit']}",
+                "",
+                "| Role | Payload Tokens | Reused Tokens | Materialized Tokens | Resident Hits | Overlap Tokens | Exact Duplicates | Reuse Efficiency | Net Token Benefit |",
+                "| - | -: | -: | -: | -: | -: | -: | -: | -: |",
+            ]
+        )
+        for row in request_selection_utility["role_rows"]:
+            lines.append(
+                f"| {row['role']} | {row['payload_tokens']} | {row['reused_tokens']} | "
+                f"{row['materialized_tokens']} | {row['resident_hits']} | "
+                f"{row['overlap_tokens']} | {row['exact_duplicate_count']} | "
+                f"{row['reuse_efficiency']:.2f} | {row['net_token_benefit']} |"
+            )
+
     if "providers" in report:
         lines.extend(
             [
@@ -1967,6 +1993,67 @@ def _coerce_runtime_behavior(analysis: Mapping[str, object]) -> Dict[str, object
 
 def _coerce_backend_latency(analysis: Mapping[str, object]) -> Dict[str, object]:
     return dict(analysis.get("backend_latency", _empty_backend_latency_summary()))
+
+
+def _request_selection_utility_summary(
+    runtime_behavior: Mapping[str, object],
+    backend_latency: Mapping[str, object],
+) -> Dict[str, object]:
+    runtime_rows = {
+        str(row.get("role", "unknown")): row
+        for row in runtime_behavior.get("role_rows", [])
+    }
+    latency_rows = {
+        str(row.get("role", "unknown")): row
+        for row in backend_latency.get("segment_role_rows", [])
+    }
+    roles = sorted(set(runtime_rows) | set(latency_rows))
+    role_rows: List[Dict[str, object]] = []
+    total_payload_tokens = 0
+    total_reused_tokens = 0
+    total_materialized_tokens = 0
+    total_resident_hits = 0
+
+    for role in roles:
+        runtime_row = runtime_rows.get(role, {})
+        latency_row = latency_rows.get(role, {})
+        payload_tokens = int(latency_row.get("serialized_token_count", 0))
+        reused_tokens = int(runtime_row.get("reused_tokens", 0))
+        materialized_tokens = int(runtime_row.get("materialized_tokens", 0))
+        resident_hits = int(runtime_row.get("resident_hits", 0))
+        overlap_tokens = int(latency_row.get("overlap_token_estimate", 0))
+        exact_duplicates = int(latency_row.get("exact_duplicate_count", 0))
+        role_rows.append(
+            {
+                "role": role,
+                "payload_tokens": payload_tokens,
+                "reused_tokens": reused_tokens,
+                "materialized_tokens": materialized_tokens,
+                "resident_hits": resident_hits,
+                "overlap_tokens": overlap_tokens,
+                "exact_duplicate_count": exact_duplicates,
+                "reuse_efficiency": (
+                    reused_tokens / payload_tokens if payload_tokens else 0.0
+                ),
+                "net_token_benefit": reused_tokens - payload_tokens,
+            }
+        )
+        total_payload_tokens += payload_tokens
+        total_reused_tokens += reused_tokens
+        total_materialized_tokens += materialized_tokens
+        total_resident_hits += resident_hits
+
+    return {
+        "role_rows": role_rows,
+        "total_payload_tokens": total_payload_tokens,
+        "total_reused_tokens": total_reused_tokens,
+        "total_materialized_tokens": total_materialized_tokens,
+        "total_resident_hits": total_resident_hits,
+        "overall_reuse_efficiency": (
+            total_reused_tokens / total_payload_tokens if total_payload_tokens else 0.0
+        ),
+        "overall_net_token_benefit": total_reused_tokens - total_payload_tokens,
+    }
 
 
 def _aggregate_runtime_behaviors(
@@ -2805,6 +2892,10 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
     runtime_behavior["prompt_token_reuse_fraction"] = (
         reused / total_prompt_tokens if total_prompt_tokens else 0.0
     )
+    request_selection_utility = _request_selection_utility_summary(
+        runtime_behavior,
+        backend_latency,
+    )
 
     return {
         "state_count": total_state_count,
@@ -2823,6 +2914,7 @@ def _aggregate_analyses(analyses: Sequence[Mapping[str, object]]) -> Dict[str, o
         "reuse_locality": reuse_locality,
         "runtime_behavior": runtime_behavior,
         "backend_latency": backend_latency,
+        "request_selection_utility": request_selection_utility,
         "oracle_abstraction_bridge": oracle_abstraction_bridge,
         "abstraction_bridge": _legacy_bridge_alias(oracle_abstraction_bridge),
     }

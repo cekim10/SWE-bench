@@ -214,6 +214,13 @@ def build_matched_report(
             }
         )
     if left_latency is not None and right_latency is not None:
+        additional_prompt_tokens = (
+            right_latency["total_prompt_tokens"] - left_latency["total_prompt_tokens"]
+        )
+        additional_prompt_payload_tokens = (
+            right_latency["total_prompt_payload_tokens_estimate"]
+            - left_latency["total_prompt_payload_tokens_estimate"]
+        )
         comparison["left_minus_right"].update(
             {
                 "avg_duration_ms": left_latency["avg_duration_ms"]
@@ -243,6 +250,21 @@ def build_matched_report(
             if left_latency["total_prompt_tokens"]
             else 0.0
         )
+        comparison["additional_prompt_tokens"] = additional_prompt_tokens
+        comparison["additional_prompt_payload_tokens_estimate"] = (
+            additional_prompt_payload_tokens
+        )
+        if right_runtime is not None:
+            reused_tokens = int(right_runtime["reused_tokens"])
+            comparison["net_token_benefit"] = reused_tokens - additional_prompt_tokens
+            comparison["net_payload_token_benefit"] = (
+                reused_tokens - additional_prompt_payload_tokens
+            )
+            comparison["reuse_efficiency_vs_added_prompt"] = (
+                reused_tokens / additional_prompt_tokens
+                if additional_prompt_tokens > 0
+                else 0.0
+            )
 
     return {
         "left_label": left_label,
@@ -456,13 +478,34 @@ def render_matched_markdown(report: Mapping[str, object]) -> str:
                 )
             else:
                 lines.append(f"| {metric} | {left_value} | {right_value} | {delta} |")
-        inflation = report["comparison"].get("prompt_token_inflation")
+        comparison = report.get("comparison", {})
+        inflation = comparison.get("prompt_token_inflation")
         if inflation is not None:
             lines.extend(
                 [
                     "",
                     f"- Prompt token inflation (right / left): {float(inflation):.4f}",
                 ]
+            )
+        additional_prompt_tokens = comparison.get("additional_prompt_tokens")
+        if additional_prompt_tokens is not None:
+            lines.append(
+                f"- Additional prompt tokens (right - left): {int(additional_prompt_tokens)}"
+            )
+        net_token_benefit = comparison.get("net_token_benefit")
+        if net_token_benefit is not None:
+            lines.append(
+                f"- Net token benefit (reused - added prompt): {int(net_token_benefit)}"
+            )
+        net_payload_token_benefit = comparison.get("net_payload_token_benefit")
+        if net_payload_token_benefit is not None:
+            lines.append(
+                f"- Net payload-token benefit (reused - added payload): {int(net_payload_token_benefit)}"
+            )
+        reuse_efficiency = comparison.get("reuse_efficiency_vs_added_prompt")
+        if reuse_efficiency is not None:
+            lines.append(
+                f"- Reuse efficiency vs added prompt tokens: {float(reuse_efficiency):.4f}"
             )
 
     lines.extend(
