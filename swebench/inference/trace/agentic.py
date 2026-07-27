@@ -325,6 +325,74 @@ def build_deep_research_demo_instance() -> WorkflowInstance:
     )
 
 
+def build_gaia_demo_instance() -> WorkflowInstance:
+    return WorkflowInstance(
+        instance_id="gaia__demo-1",
+        problem_statement=(
+            "Design a privacy-first local research assistant workflow that runs entirely "
+            "on-device, highlighting agent orchestration, retrieval, and recovery tradeoffs."
+        ),
+        file_contents={
+            "docs/local_agent_architecture.md": (
+                "A local research assistant can combine a planner, retriever, and writer "
+                "while keeping all user data on-device. The main tradeoff is between "
+                "semantic context richness and prompt growth across repeated agent steps.\n"
+            ),
+            "docs/tool_orchestration.md": (
+                "Tool orchestration needs stable task context, selective evidence loading, "
+                "and explicit failure recovery. Reusing stable semantic prefixes can reduce "
+                "prefill work when the workflow repeatedly revisits planning and synthesis.\n"
+            ),
+            "docs/privacy_runtime.md": (
+                "Fully local execution improves privacy and removes API cost, but it makes "
+                "serving efficiency more important because every repeated prompt must be "
+                "handled on the same device budget.\n"
+            ),
+        },
+        readmes={
+            "README.md": (
+                "Treat each markdown file as one local knowledge source. The answer should "
+                "emphasize on-device execution, tool orchestration, and runtime efficiency."
+            )
+        },
+    )
+
+
+def build_hotpotqa_demo_instance() -> WorkflowInstance:
+    return WorkflowInstance(
+        instance_id="hotpotqa__demo-1",
+        problem_statement=(
+            "Which novel by the author of Animal Farm features the slogans "
+            "'War is Peace' and 'Freedom is Slavery'?"
+        ),
+        file_contents={
+            "wiki/animal_farm.md": (
+                "Animal Farm is a satirical novella by George Orwell, first published in 1945. "
+                "George Orwell is the pen name of Eric Arthur Blair.\n"
+            ),
+            "wiki/george_orwell.md": (
+                "George Orwell wrote the dystopian novel Nineteen Eighty-Four. "
+                "The novel's party slogans include 'War is Peace', 'Freedom is Slavery', "
+                "and 'Ignorance is Strength'.\n"
+            ),
+            "wiki/nineteen_eighty_four.md": (
+                "Nineteen Eighty-Four is a dystopian social science fiction novel by George Orwell. "
+                "It describes the superstate Oceania and the ideological control of the Party.\n"
+            ),
+        },
+        readmes={
+            "README.md": (
+                "Solve the question with explicit multi-hop reasoning across the provided "
+                "documents and keep the final answer concise."
+            )
+        },
+        metadata={
+            "answer": "Nineteen Eighty-Four",
+            "question_type": "bridge",
+        },
+    )
+
+
 @dataclass(frozen=True)
 class OpenDeepResearchPromptPack:
     repo_path: Path
@@ -359,6 +427,21 @@ class OpenHandsPromptPack:
     development_guidance: str
 
 
+@dataclass(frozen=True)
+class GAIAPromptPack:
+    repo_path: Path
+    readme_path: Path
+    readme_text: str
+    agents_guidance: str
+
+
+@dataclass(frozen=True)
+class HotpotQAPromptPack:
+    repo_path: Path
+    readme_path: Path
+    readme_text: str
+
+
 def _default_open_deep_research_repo_path() -> Path | None:
     candidate = Path(__file__).resolve().parents[3] / ".external" / "open_deep_research"
     return candidate if candidate.exists() else None
@@ -373,6 +456,22 @@ def _default_openhands_repo_path() -> Path | None:
     candidates = [
         Path(__file__).resolve().parents[3] / ".external" / "openhands",
         Path(__file__).resolve().parents[3] / ".external" / "OpenHands",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _default_gaia_repo_path() -> Path | None:
+    candidate = Path(__file__).resolve().parents[3] / ".external" / "gaia"
+    return candidate if candidate.exists() else None
+
+
+def _default_hotpotqa_repo_path() -> Path | None:
+    candidates = [
+        Path(__file__).resolve().parents[3] / ".external" / "hotpot",
+        Path(__file__).resolve().parents[3] / ".external" / "hotpotqa",
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -631,6 +730,77 @@ def load_openhands_prompt_pack(
             else "OpenHands repository guidance file AGENTS.md was not present in this checkout."
         ),
         development_guidance=development_guidance,
+    )
+
+
+def load_gaia_prompt_pack(
+    repo_path: str | Path | None = None,
+) -> GAIAPromptPack:
+    resolved_repo_path = (
+        Path(repo_path).expanduser().resolve()
+        if repo_path is not None
+        else _default_gaia_repo_path()
+    )
+    if resolved_repo_path is None or not resolved_repo_path.exists():
+        raise RuntimeError(
+            "GAIA repo not found. Clone amd/gaia and pass --gaia_path, or place it at "
+            "'./.external/gaia'."
+        )
+
+    readme_path = resolved_repo_path / "README.md"
+    agents_path = resolved_repo_path / "AGENTS.md"
+    agent_base_candidates = [
+        resolved_repo_path / "src" / "gaia" / "agents" / "base" / "agent.py",
+        resolved_repo_path / "src" / "gaia" / "agents" / "base" / "agent.ts",
+    ]
+    has_agent_base = any(path.exists() for path in agent_base_candidates)
+    if not readme_path.exists() or not has_agent_base:
+        raise RuntimeError(
+            f"{resolved_repo_path} does not look like an amd/gaia checkout"
+        )
+
+    readme_text = readme_path.read_text(encoding="utf-8")
+    agents_guidance = (
+        agents_path.read_text(encoding="utf-8")
+        if agents_path.exists()
+        else "GAIA repository guidance file AGENTS.md was not present in this checkout."
+    )
+    return GAIAPromptPack(
+        repo_path=resolved_repo_path,
+        readme_path=readme_path,
+        readme_text=readme_text,
+        agents_guidance=agents_guidance,
+    )
+
+
+def load_hotpotqa_prompt_pack(
+    repo_path: str | Path | None = None,
+) -> HotpotQAPromptPack:
+    resolved_repo_path = (
+        Path(repo_path).expanduser().resolve()
+        if repo_path is not None
+        else _default_hotpotqa_repo_path()
+    )
+    if resolved_repo_path is None or not resolved_repo_path.exists():
+        raise RuntimeError(
+            "HotpotQA repo not found. Clone hotpotqa/hotpot and pass --hotpotqa_path, "
+            "or place it at './.external/hotpot'."
+        )
+
+    readme_path = resolved_repo_path / "README.md"
+    baseline_candidates = [
+        resolved_repo_path / "hotpot_evaluate_v1.py",
+        resolved_repo_path / "main.py",
+    ]
+    if not readme_path.exists() or not any(path.exists() for path in baseline_candidates):
+        raise RuntimeError(
+            f"{resolved_repo_path} does not look like a hotpotqa/hotpot checkout"
+        )
+
+    return HotpotQAPromptPack(
+        repo_path=resolved_repo_path,
+        readme_path=readme_path,
+        readme_text=readme_path.read_text(encoding="utf-8"),
     )
 
 
@@ -4451,7 +4621,14 @@ class SyntheticStressTracedAgentRunner(TracedAgentRunner):
 
 
 class DeepResearchTracedAgentRunner(TracedAgentRunner):
+    def _research_agent_family_name(self) -> str:
+        return "deep_research"
+
+    def _research_result_workload_metadata(self) -> Dict[str, object]:
+        return {}
+
     def run_instance(self, instance: WorkflowInstance) -> Dict[str, object]:
+        agent_family = self._research_agent_family_name()
         trace_path = self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}.jsonl"
         runtime_event_path = (
             self.trace_dir / f"{sanitize_state_suffix(instance.instance_id)}_runtime.jsonl"
@@ -4487,7 +4664,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                     is_shared=True,
                     is_ephemeral=False,
                     update_cause="static",
-                    agent_family="deep_research",
+                    agent_family=agent_family,
                 ),
             )
             self._register_runtime_segment(
@@ -4501,7 +4678,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                 is_shared=True,
                 is_immutable=True,
                 is_ephemeral=False,
-                metadata={"agent_family": "deep_research"},
+                metadata={"agent_family": agent_family},
             )
             task_state = trace.create_state(
                 state_id="task_v1",
@@ -4518,7 +4695,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                     is_shared=True,
                     is_ephemeral=False,
                     update_cause="task_fixed",
-                    agent_family="deep_research",
+                    agent_family=agent_family,
                 ),
             )
             self._register_runtime_segment(
@@ -4532,7 +4709,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                 is_shared=True,
                 is_immutable=True,
                 is_ephemeral=False,
-                metadata={"agent_family": "deep_research"},
+                metadata={"agent_family": agent_family},
             )
             source_states = self._create_text_states(
                 trace=trace,
@@ -4560,7 +4737,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                     is_shared=True,
                     is_immutable=True,
                     is_ephemeral=False,
-                    metadata={"agent_family": "deep_research"},
+                    metadata={"agent_family": agent_family},
                 )
 
             live_state_ids = {system_state.state_id, task_state.state_id}
@@ -4648,7 +4825,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                         is_ephemeral=False,
                         update_cause="research_replan",
                         iteration=iteration,
-                        agent_family="deep_research",
+                        agent_family=agent_family,
                     ),
                 )
                 self._register_runtime_segment(
@@ -4662,7 +4839,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=False,
                     is_ephemeral=False,
-                    metadata={"agent_family": "deep_research"},
+                    metadata={"agent_family": agent_family},
                 )
                 live_state_ids.add(plan_state.state_id)
                 if current_plan_id is not None:
@@ -4745,7 +4922,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                         update_cause="source_read",
                         iteration=iteration,
                         source=focused_source_name,
-                        agent_family="deep_research",
+                        agent_family=agent_family,
                     ),
                 )
                 self._register_runtime_segment(
@@ -4759,7 +4936,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=False,
                     is_ephemeral=False,
-                    metadata={"agent_family": "deep_research"},
+                    metadata={"agent_family": agent_family},
                 )
                 live_state_ids.add(note_state.state_id)
                 note_state_ids.append(note_state.state_id)
@@ -4822,7 +4999,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                         is_ephemeral=False,
                         update_cause="draft_revision",
                         iteration=iteration,
-                        agent_family="deep_research",
+                        agent_family=agent_family,
                     ),
                 )
                 self._register_runtime_segment(
@@ -4836,7 +5013,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=False,
                     is_ephemeral=False,
-                    metadata={"agent_family": "deep_research"},
+                    metadata={"agent_family": agent_family},
                 )
                 live_state_ids.add(draft_state.state_id)
                 if current_draft_id is not None:
@@ -4908,7 +5085,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                         is_ephemeral=True,
                         update_cause="draft_feedback",
                         iteration=iteration,
-                        agent_family="deep_research",
+                        agent_family=agent_family,
                     ),
                 )
                 self._register_runtime_segment(
@@ -4922,7 +5099,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                     is_shared=False,
                     is_immutable=False,
                     is_ephemeral=True,
-                    metadata={"agent_family": "deep_research"},
+                    metadata={"agent_family": agent_family},
                 )
                 live_state_ids.add(critique_state.state_id)
                 if current_critique_id is not None:
@@ -4963,7 +5140,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
             materializer=materializer,
             runtime_event_path=runtime_event_path,
             workflow_id=instance.instance_id,
-            agent_family="deep_research",
+            agent_family=agent_family,
         )
         self._write_backend_call_records(
             backend_call_path=backend_call_path,
@@ -4974,7 +5151,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
             "instance_id": instance.instance_id,
             "status": "COMPLETED",
             "provider": getattr(self.backend, "name", self.backend.__class__.__name__),
-            "agent_family": "deep_research",
+            "agent_family": agent_family,
             "prompt_runtime_mode": self.prompt_runtime_mode,
             "plan": final_plan_text,
             "patch": final_draft_text,
@@ -4989,6 +5166,7 @@ class DeepResearchTracedAgentRunner(TracedAgentRunner):
                 "errors": validation.errors,
                 "summary": validation.summary,
             },
+            **self._research_result_workload_metadata(),
         }
 
 
@@ -5114,6 +5292,242 @@ class OpenDeepResearchTracedAgentRunner(DeepResearchTracedAgentRunner):
         result["workload_source"] = "open_deep_research"
         result["open_deep_research_path"] = str(self._open_deep_research_prompts.repo_path)
         return result
+
+
+class GAIATracedAgentRunner(DeepResearchTracedAgentRunner):
+    def __init__(
+        self,
+        *,
+        backend: ModelBackend,
+        trace_dir: str | Path,
+        tenant_id: str = "local",
+        max_iterations: int = 2,
+        max_files: int = 5,
+        prompt_runtime_mode: str = "monolithic",
+        gaia_path: str | Path | None = None,
+    ) -> None:
+        super().__init__(
+            backend=backend,
+            trace_dir=trace_dir,
+            tenant_id=tenant_id,
+            max_iterations=max_iterations,
+            max_files=max_files,
+            prompt_runtime_mode=prompt_runtime_mode,
+        )
+        self._gaia_prompts = load_gaia_prompt_pack(gaia_path)
+
+    def _research_agent_family_name(self) -> str:
+        return "gaia"
+
+    def _research_result_workload_metadata(self) -> Dict[str, object]:
+        return {
+            "workload_source": "gaia",
+            "gaia_path": str(self._gaia_prompts.repo_path),
+        }
+
+    def _gaia_repo_excerpt(self) -> str:
+        readme_excerpt = truncate_text(
+            self._gaia_prompts.readme_text.strip().replace("\r\n", "\n"),
+            1800,
+        )
+        agents_excerpt = truncate_text(
+            self._gaia_prompts.agents_guidance.strip().replace("\r\n", "\n"),
+            1200,
+        )
+        if agents_excerpt:
+            return f"{readme_excerpt}\n\nRepository guidance:\n{agents_excerpt}"
+        return readme_excerpt
+
+    def _research_planner_system_prompt(self) -> str:
+        return (
+            "You are a GAIA-style local agent orchestrator. Keep execution fully on-device, "
+            "reason over the provided semantic context, and preserve stable reusable context "
+            "across planning and synthesis steps.\n\n"
+            f"{self._gaia_repo_excerpt()}"
+        )
+
+    def _research_planner_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Task:\n{instance.problem_statement}\n\n"
+            f"GAIA planning iteration: {iteration}\n"
+            "Produce the next local-agent plan using the provided task, evidence, and prior "
+            "notes. Emphasize privacy, local execution, and runtime efficiency."
+        )
+
+    def _research_reader_system_prompt(self) -> str:
+        return (
+            "You are a GAIA retrieval-and-reading agent. Extract only the evidence that should "
+            "remain active in later local-agent steps."
+        )
+
+    def _research_reader_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+        source_name: str,
+    ) -> str:
+        return (
+            f"Task:\n{instance.problem_statement}\n\n"
+            f"Focused source: {source_name}\n"
+            f"Reader iteration: {iteration}\n"
+            "Summarize the source with emphasis on reusable local-agent state, tool orchestration, "
+            "and lifecycle-sensitive runtime behavior."
+        )
+
+    def _research_writer_system_prompt(self) -> str:
+        return (
+            "You are a GAIA synthesis agent. Consolidate active notes into a coherent answer "
+            "without repeating already stable context."
+        )
+
+    def _research_writer_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Task:\n{instance.problem_statement}\n\n"
+            f"Synthesis iteration: {iteration}\n"
+            "Draft or revise the answer using only the active task, plan, and evidence summaries."
+        )
+
+    def _research_critic_system_prompt(self) -> str:
+        return (
+            "You are a GAIA answer critic. Check that the answer remains grounded in the active "
+            "evidence and that it clearly describes local-agent runtime tradeoffs."
+        )
+
+    def _research_critic_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Task:\n{instance.problem_statement}\n\n"
+            f"Critique iteration: {iteration}\n"
+            "Review the current answer draft using the active plan and summaries. Point out "
+            "missing evidence or claims that should be tightened before the next revision."
+        )
+
+
+class HotpotQATracedAgentRunner(DeepResearchTracedAgentRunner):
+    def __init__(
+        self,
+        *,
+        backend: ModelBackend,
+        trace_dir: str | Path,
+        tenant_id: str = "local",
+        max_iterations: int = 2,
+        max_files: int = 5,
+        prompt_runtime_mode: str = "monolithic",
+        hotpotqa_path: str | Path | None = None,
+    ) -> None:
+        super().__init__(
+            backend=backend,
+            trace_dir=trace_dir,
+            tenant_id=tenant_id,
+            max_iterations=max_iterations,
+            max_files=max_files,
+            prompt_runtime_mode=prompt_runtime_mode,
+        )
+        self._hotpotqa_prompts = load_hotpotqa_prompt_pack(hotpotqa_path)
+
+    def _research_agent_family_name(self) -> str:
+        return "hotpotqa"
+
+    def _research_result_workload_metadata(self) -> Dict[str, object]:
+        return {
+            "workload_source": "hotpotqa",
+            "hotpotqa_path": str(self._hotpotqa_prompts.repo_path),
+        }
+
+    def _hotpot_readme_excerpt(self) -> str:
+        return truncate_text(
+            self._hotpotqa_prompts.readme_text.strip().replace("\r\n", "\n"),
+            1400,
+        )
+
+    def _research_planner_system_prompt(self) -> str:
+        return (
+            "You are a HotpotQA-style multi-hop question answering planner. Build a short "
+            "reasoning plan that identifies which evidence segments need to be combined.\n\n"
+            f"{self._hotpot_readme_excerpt()}"
+        )
+
+    def _research_planner_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Question:\n{instance.problem_statement}\n\n"
+            f"Planning hop: {iteration}\n"
+            "Identify the next reasoning hop and the evidence segments that should remain active."
+        )
+
+    def _research_reader_system_prompt(self) -> str:
+        return (
+            "You are a multi-hop evidence reader. Extract the fact from the focused source that "
+            "best advances the current question."
+        )
+
+    def _research_reader_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+        source_name: str,
+    ) -> str:
+        return (
+            f"Question:\n{instance.problem_statement}\n\n"
+            f"Focused evidence: {source_name}\n"
+            f"Hop iteration: {iteration}\n"
+            "Extract the key fact and explain how it links to the next required hop."
+        )
+
+    def _research_writer_system_prompt(self) -> str:
+        return (
+            "You are a HotpotQA answer synthesizer. Combine the active hop notes into a concise "
+            "candidate answer."
+        )
+
+    def _research_writer_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Question:\n{instance.problem_statement}\n\n"
+            f"Answer draft iteration: {iteration}\n"
+            "Use only the active plan and extracted hop notes to draft the best current answer."
+        )
+
+    def _research_critic_system_prompt(self) -> str:
+        return (
+            "You are a HotpotQA verifier. Check that the candidate answer is supported by the "
+            "active evidence chain and note any missing hop."
+        )
+
+    def _research_critic_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        answer_hint = str(instance.metadata.get("answer", "")).strip()
+        reference_line = (
+            f"Reference answer for sanity check: {answer_hint}\n"
+            if answer_hint
+            else ""
+        )
+        return (
+            f"Question:\n{instance.problem_statement}\n\n"
+            f"{reference_line}"
+            f"Verification iteration: {iteration}\n"
+            "Evaluate whether the candidate answer follows from the active multi-hop evidence."
+        )
 
 
 class LangGraphTracedAgentRunner(TracedAgentRunner):

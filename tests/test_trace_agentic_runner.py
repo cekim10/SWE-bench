@@ -11,6 +11,7 @@ from textwrap import dedent
 ROOT = Path(__file__).resolve().parents[1]
 TRACE_DIR = ROOT / "swebench" / "inference" / "trace"
 RUNTIME_DIR = ROOT / "swebench" / "inference" / "runtime"
+INFERENCE_DIR = ROOT / "swebench" / "inference"
 
 
 def load_trace_modules():
@@ -59,6 +60,23 @@ def load_trace_modules():
 
 
 SEMANTIC_STATE, AGENTIC = load_trace_modules()
+
+
+def load_hotpot_runner_module():
+    module_name = "swebench.inference.run_hotpotqa_workflow"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        INFERENCE_DIR / "run_hotpotqa_workflow.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("failed to load run_hotpotqa_workflow.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+HOTPOT_RUNNER = load_hotpot_runner_module()
 
 
 class TraceAgenticRunnerTests(unittest.TestCase):
@@ -377,6 +395,153 @@ class TraceAgenticRunnerTests(unittest.TestCase):
             self.assertTrue(
                 all(call.get("segment_request") is not None for call in backend.calls)
             )
+
+    def test_load_gaia_prompt_pack_from_repo_checkout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "gaia"
+            agent_dir = repo_root / "src" / "gaia" / "agents" / "base"
+            agent_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "README.md").write_text(
+                "UPSTREAM_GAIA_README\n\nBuild local agents with tool orchestration.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text(
+                "UPSTREAM_GAIA_GUIDE\n\nPrefer local execution.\n",
+                encoding="utf-8",
+            )
+            (agent_dir / "agent.py").write_text(
+                "class Agent:\n    pass\n",
+                encoding="utf-8",
+            )
+
+            prompt_pack = AGENTIC.load_gaia_prompt_pack(repo_root)
+            self.assertEqual(prompt_pack.repo_path, repo_root.resolve())
+            self.assertIn("UPSTREAM_GAIA_README", prompt_pack.readme_text)
+            self.assertIn("UPSTREAM_GAIA_GUIDE", prompt_pack.agents_guidance)
+
+    def test_gaia_runner_uses_upstream_prompt_pack(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "gaia"
+            agent_dir = repo_root / "src" / "gaia" / "agents" / "base"
+            agent_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "README.md").write_text(
+                "UPSTREAM_GAIA_README\n\nBuild local agents with tool orchestration.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text(
+                "UPSTREAM_GAIA_GUIDE\n\nPrefer local execution.\n",
+                encoding="utf-8",
+            )
+            (agent_dir / "agent.py").write_text(
+                "class Agent:\n    pass\n",
+                encoding="utf-8",
+            )
+
+            backend = self.CapturingBackend()
+            runner = AGENTIC.GAIATracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=2,
+                prompt_runtime_mode="segment_aware",
+                gaia_path=repo_root,
+            )
+            result = runner.run_instance(AGENTIC.build_gaia_demo_instance())
+            self.assertEqual(result["agent_family"], "gaia")
+            self.assertEqual(result["workload_source"], "gaia")
+            self.assertEqual(Path(result["gaia_path"]), repo_root.resolve())
+            self.assertGreater(len(backend.calls), 0)
+            self.assertTrue(
+                any(
+                    "UPSTREAM_GAIA_README" in call.get("system_prompt", "")
+                    for call in backend.calls
+                )
+            )
+
+    def test_load_hotpotqa_prompt_pack_from_repo_checkout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "hotpot"
+            repo_root.mkdir(parents=True, exist_ok=True)
+            (repo_root / "README.md").write_text(
+                "UPSTREAM_HOTPOT_README\n\nMulti-hop QA baseline.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "hotpot_evaluate_v1.py").write_text(
+                "def evaluate():\n    return {}\n",
+                encoding="utf-8",
+            )
+
+            prompt_pack = AGENTIC.load_hotpotqa_prompt_pack(repo_root)
+            self.assertEqual(prompt_pack.repo_path, repo_root.resolve())
+            self.assertIn("UPSTREAM_HOTPOT_README", prompt_pack.readme_text)
+
+    def test_hotpotqa_runner_uses_upstream_prompt_pack(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "hotpot"
+            repo_root.mkdir(parents=True, exist_ok=True)
+            (repo_root / "README.md").write_text(
+                "UPSTREAM_HOTPOT_README\n\nMulti-hop QA baseline.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "hotpot_evaluate_v1.py").write_text(
+                "def evaluate():\n    return {}\n",
+                encoding="utf-8",
+            )
+
+            backend = self.CapturingBackend()
+            runner = AGENTIC.HotpotQATracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=3,
+                prompt_runtime_mode="segment_aware",
+                hotpotqa_path=repo_root,
+            )
+            result = runner.run_instance(AGENTIC.build_hotpotqa_demo_instance())
+            self.assertEqual(result["agent_family"], "hotpotqa")
+            self.assertEqual(result["workload_source"], "hotpotqa")
+            self.assertEqual(Path(result["hotpotqa_path"]), repo_root.resolve())
+            self.assertGreater(len(backend.calls), 0)
+            self.assertTrue(
+                any(
+                    "UPSTREAM_HOTPOT_README" in call.get("system_prompt", "")
+                    for call in backend.calls
+                )
+            )
+
+    def test_hotpotqa_example_loader_converts_official_style_examples(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            examples_path = Path(tmpdir) / "hotpot_examples.json"
+            examples_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "_id": "hp-1",
+                            "question": "Who wrote Animal Farm?",
+                            "answer": "George Orwell",
+                            "type": "bridge",
+                            "supporting_facts": [["Animal Farm", 0]],
+                            "context": [
+                                ["Animal Farm", ["Animal Farm is a novella by George Orwell."]],
+                                ["George Orwell", ["George Orwell wrote Nineteen Eighty-Four."]],
+                            ],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            instances = HOTPOT_RUNNER.load_hotpotqa_instances_from_path(
+                examples_path,
+                limit=1,
+            )
+            self.assertEqual(len(instances), 1)
+            self.assertEqual(instances[0].instance_id, "hp-1")
+            self.assertEqual(instances[0].problem_statement, "Who wrote Animal Farm?")
+            self.assertIn("answer", instances[0].metadata)
+            self.assertTrue(instances[0].file_contents)
 
     def test_load_swe_agent_prompt_pack_from_repo_checkout(self):
         with tempfile.TemporaryDirectory() as tmpdir:
