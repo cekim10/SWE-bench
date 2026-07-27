@@ -1186,6 +1186,11 @@ class OpenAICompatibleChatBackend:
 
 class VLLMServerChatBackend:
     name = "vllm"
+    transport_name = "openai-compatible-vllm"
+    default_base_url_env = "VLLM_BASE_URL"
+    default_api_key_env = "VLLM_API_KEY"
+    default_base_url = "http://localhost:8000/v1"
+    default_api_key = "EMPTY"
 
     def __init__(
         self,
@@ -1200,8 +1205,9 @@ class VLLMServerChatBackend:
         self._call_records: List[Dict[str, object]] = []
         self._message_cache: Dict[str, tuple[tuple[str, str], ...]] = {}
         self.adapter = OpenAICompatibleVLLMAdapter(
-            base_url=base_url or os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1"),
-            api_key=os.environ.get("VLLM_API_KEY", "EMPTY"),
+            base_url=base_url
+            or os.environ.get(self.default_base_url_env, self.default_base_url),
+            api_key=os.environ.get(self.default_api_key_env, self.default_api_key),
             timeout=timeout,
             max_retries=max_retries,
         )
@@ -1409,7 +1415,7 @@ class VLLMServerChatBackend:
             "step_name": step_name,
             "prompt_mode": prompt_mode,
             "temperature": self.temperature,
-            "transport": "openai-compatible-vllm",
+            "transport": self.transport_name,
             "apc_enabled": True,
         }
 
@@ -1460,6 +1466,15 @@ class OllamaChatBackend(OpenAICompatibleChatBackend):
             timeout=timeout,
             max_retries=max_retries,
         )
+
+
+class ContinuumServerChatBackend(VLLMServerChatBackend):
+    name = "continuum"
+    transport_name = "openai-compatible-continuum"
+    default_base_url_env = "CONTINUUM_BASE_URL"
+    default_api_key_env = "CONTINUUM_API_KEY"
+    default_base_url = "http://localhost:8001/v1"
+    default_api_key = "EMPTY"
 
 
 class GroqChatBackend(OpenAICompatibleChatBackend):
@@ -1576,6 +1591,10 @@ def make_backend(
         if not model:
             raise ValueError("--model is required for provider=vllm")
         return VLLMServerChatBackend(model=model, timeout=timeout, max_retries=max_retries)
+    if provider == "continuum":
+        if not model:
+            raise ValueError("--model is required for provider=continuum")
+        return ContinuumServerChatBackend(model=model, timeout=timeout, max_retries=max_retries)
     if provider == "anthropic":
         if not model:
             raise ValueError("--model is required for provider=anthropic")

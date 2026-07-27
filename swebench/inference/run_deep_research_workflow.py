@@ -31,7 +31,7 @@ def parse_args():
     )
     parser.add_argument(
         "--provider",
-        choices=["stub", "openai", "anthropic", "ollama", "groq", "vllm"],
+        choices=["stub", "openai", "anthropic", "ollama", "groq", "vllm", "continuum"],
         default="stub",
     )
     parser.add_argument("--model", type=str, default=None)

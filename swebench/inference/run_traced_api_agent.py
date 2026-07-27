@@ -30,7 +30,7 @@ def parse_args():
     )
     parser.add_argument(
         "--provider",
-        choices=["stub", "openai", "anthropic", "ollama", "groq", "vllm"],
+        choices=["stub", "openai", "anthropic", "ollama", "groq", "vllm", "continuum"],
         default="stub",
         help="Model backend to use. `stub` requires no API access and is useful for trace sanity checks.",
     )
@@ -38,7 +38,7 @@ def parse_args():
         "--model",
         type=str,
         default=None,
-        help="Model name for provider=openai, provider=anthropic, provider=ollama, or provider=groq.",
+        help="Model name for provider=openai, provider=anthropic, provider=ollama, provider=groq, provider=vllm, or provider=continuum.",
     )
     parser.add_argument(
         "--trace_dir",

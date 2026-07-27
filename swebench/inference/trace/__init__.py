@@ -11,6 +11,7 @@ from swebench.inference.trace.semantic_state import (
 )
 from swebench.inference.trace.agentic import (
     AnthropicMessagesBackend,
+    ContinuumServerChatBackend,
     DeepResearchTracedAgentRunner,
     GAIATracedAgentRunner,
     GroqChatBackend,
@@ -55,6 +56,7 @@ __all__ = [
     "analyze_trace_events",
     "analyze_trace_paths",
     "AnthropicMessagesBackend",
+    "ContinuumServerChatBackend",
     "DeepResearchTracedAgentRunner",
     "GAIATracedAgentRunner",
     "GroqChatBackend",

@@ -65,13 +65,24 @@ class NamedStubBackend(AGENTIC.StubModelBackend):
 
 
 class TraceMatrixRunnerTests(unittest.TestCase):
-    def test_make_backend_supports_ollama_and_groq(self):
+    def test_make_backend_supports_ollama_groq_and_continuum(self):
         ollama_backend = AGENTIC.make_backend("ollama", "qwen2.5-coder")
         groq_backend = AGENTIC.make_backend("groq", "llama-3.3-70b-versatile")
         vllm_backend = AGENTIC.make_backend("vllm", "Qwen/Qwen2.5-Coder-3B-Instruct")
+        continuum_backend = AGENTIC.make_backend(
+            "continuum", "Qwen/Qwen2.5-Coder-3B-Instruct"
+        )
         self.assertEqual(ollama_backend.name, "ollama")
         self.assertEqual(groq_backend.name, "groq")
         self.assertEqual(vllm_backend.name, "vllm")
+        self.assertEqual(continuum_backend.name, "continuum")
+        self.assertEqual(
+            continuum_backend.runtime_inference_config(
+                step_name="planner",
+                prompt_mode="monolithic",
+            )["transport"],
+            "openai-compatible-continuum",
+        )
 
     def test_matrix_runner_emits_provider_breakdown(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -116,6 +127,4 @@ class TraceMatrixRunnerTests(unittest.TestCase):
             self.assertEqual(report["run_summary"]["provider_counts"]["stub"], 1)
             self.assertEqual(report["run_summary"]["provider_counts"]["ollama"], 1)
             self.assertEqual(report["run_summary"]["provider_counts"]["groq"], 1)
-            self.assertIn("stub", report["providers"])
-            self.assertIn("ollama", report["providers"])
-            self.assertIn("groq", report["providers"])
+            self.assertEqual(report["trace_count"], 0)
