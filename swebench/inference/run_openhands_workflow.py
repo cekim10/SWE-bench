@@ -59,6 +59,7 @@ def parse_args():
         choices=[
             "default",
             "task_only",
+            "task_latest_artifact",
             "task_plan",
             "task_plan_artifact",
             "task_plan_artifact_budgeted_evidence",

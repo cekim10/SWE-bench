@@ -783,6 +783,12 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 step_name="coder",
                 segments=coder_segments,
             )
+            task_latest_artifact_ids = make_runner(
+                "task_latest_artifact"
+            )._request_segment_ids_for_step(
+                step_name="coder",
+                segments=coder_segments,
+            )
             task_plan_artifact_ids = make_runner(
                 "task_plan_artifact"
             )._request_segment_ids_for_step(
@@ -798,6 +804,7 @@ class TraceAgenticRunnerTests(unittest.TestCase):
 
             self.assertEqual(task_only_ids, ["task_v1"])
             self.assertEqual(task_plan_ids, ["task_v1", "plan_v1"])
+            self.assertEqual(task_latest_artifact_ids, ["task_v1", "patch_v1"])
             self.assertEqual(task_plan_artifact_ids, ["task_v1", "plan_v1", "patch_v1"])
             self.assertEqual(
                 budgeted_ids,

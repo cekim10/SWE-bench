@@ -3740,6 +3740,29 @@ class _OpenHandsPromptBackedMixin:
                 "tester": 0,
             },
         },
+        "task_latest_artifact": {
+            "mandatory_roles_by_step": {
+                "router": {"task", "scratchpad"},
+                "planner": {"task", "router", "scratchpad"},
+                "coder": {"task", "artifact"},
+                "reviewer": {"task", "artifact"},
+                "tester": {"task", "artifact", "review"},
+            },
+            "optional_roles_by_step": {
+                "router": set(),
+                "planner": set(),
+                "coder": set(),
+                "reviewer": set(),
+                "tester": set(),
+            },
+            "evidence_token_budget_by_step": {
+                "router": 0,
+                "planner": 0,
+                "coder": 0,
+                "reviewer": 0,
+                "tester": 0,
+            },
+        },
         "task_plan": {
             "mandatory_roles_by_step": {
                 "router": {"task", "scratchpad"},
