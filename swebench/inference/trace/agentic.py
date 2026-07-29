@@ -31,6 +31,7 @@ from swebench.inference.trace.semantic_state import TraceLogger
 
 PASS_TOKENS = {"PASS", "RESOLVED", "SUCCESS"}
 FAIL_TOKENS = {"FAIL", "UNRESOLVED", "ERROR"}
+DEFAULT_COMPLETION_MAX_TOKENS = 1024
 
 
 class LangGraphRunnerState(TypedDict, total=False):
@@ -1090,6 +1091,7 @@ class OpenAICompatibleChatBackend:
         api_key: str | None = None,
         timeout: float = 120.0,
         max_retries: int = 2,
+        max_tokens: int | None = DEFAULT_COMPLETION_MAX_TOKENS,
     ) -> None:
         self.name = provider_name
         self.model = model
@@ -1099,6 +1101,7 @@ class OpenAICompatibleChatBackend:
         self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
+        self.max_tokens = max_tokens
         self._call_records: List[Dict[str, object]] = []
 
     def _client(self):
@@ -1151,18 +1154,17 @@ class OpenAICompatibleChatBackend:
                 {"role": "user", "content": user_prompt},
             ]
         )
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+        }
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
         if mode == "client":
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-            )
+            response = client.chat.completions.create(**payload)
             return response.choices[0].message.content or ""
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=self.temperature,
-        )
+        response = client.chat.completions.create(**payload)
         return response.choices[0].message.content or ""
 
     @property
@@ -1184,6 +1186,7 @@ class OpenAICompatibleChatBackend:
             "step_name": step_name,
             "prompt_mode": prompt_mode,
             "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
         }
 
     def drain_call_records(self) -> List[Dict[str, object]]:
@@ -1207,9 +1210,11 @@ class VLLMServerChatBackend:
         base_url: str | None = None,
         timeout: float = 120.0,
         max_retries: int = 2,
+        max_tokens: int | None = DEFAULT_COMPLETION_MAX_TOKENS,
     ) -> None:
         self.model = model
         self.temperature = temperature
+        self.max_tokens = max_tokens
         self._call_records: List[Dict[str, object]] = []
         self._message_cache: Dict[str, tuple[tuple[str, str], ...]] = {}
         self.adapter = OpenAICompatibleVLLMAdapter(
@@ -1239,6 +1244,7 @@ class VLLMServerChatBackend:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=self.temperature,
+            max_tokens=self.max_tokens,
             prompt_mode=prompt_mode,
             segment_request=segment_request,
             extra_body={
@@ -1443,6 +1449,7 @@ class VLLMServerChatBackend:
             "temperature": self.temperature,
             "transport": self.transport_name,
             "apc_enabled": True,
+            "max_tokens": self.max_tokens,
         }
 
     def drain_call_records(self) -> List[Dict[str, object]]:
@@ -1460,6 +1467,7 @@ class OpenAIChatBackend(OpenAICompatibleChatBackend):
         temperature: float = 0.0,
         timeout: float = 120.0,
         max_retries: int = 2,
+        max_tokens: int | None = DEFAULT_COMPLETION_MAX_TOKENS,
     ) -> None:
         super().__init__(
             provider_name="openai",
@@ -1467,6 +1475,7 @@ class OpenAIChatBackend(OpenAICompatibleChatBackend):
             temperature=temperature,
             timeout=timeout,
             max_retries=max_retries,
+            max_tokens=max_tokens,
         )
 
 
@@ -1480,6 +1489,7 @@ class OllamaChatBackend(OpenAICompatibleChatBackend):
         base_url: str | None = None,
         timeout: float = 120.0,
         max_retries: int = 2,
+        max_tokens: int | None = DEFAULT_COMPLETION_MAX_TOKENS,
     ) -> None:
         import os
 
@@ -1491,6 +1501,7 @@ class OllamaChatBackend(OpenAICompatibleChatBackend):
             api_key="ollama",
             timeout=timeout,
             max_retries=max_retries,
+            max_tokens=max_tokens,
         )
 
 
@@ -1513,6 +1524,7 @@ class GroqChatBackend(OpenAICompatibleChatBackend):
         base_url: str | None = None,
         timeout: float = 120.0,
         max_retries: int = 2,
+        max_tokens: int | None = DEFAULT_COMPLETION_MAX_TOKENS,
     ) -> None:
         import os
 
@@ -1524,15 +1536,22 @@ class GroqChatBackend(OpenAICompatibleChatBackend):
             api_key_env="GROQ_API_KEY",
             timeout=timeout,
             max_retries=max_retries,
+            max_tokens=max_tokens,
         )
 
 
 class AnthropicMessagesBackend:
     name = "anthropic"
 
-    def __init__(self, model: str, temperature: float = 0.0) -> None:
+    def __init__(
+        self,
+        model: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = DEFAULT_COMPLETION_MAX_TOKENS,
+    ) -> None:
         self.model = model
         self.temperature = temperature
+        self.max_tokens = max_tokens
         self._call_records: List[Dict[str, object]] = []
 
     def complete(
@@ -1556,7 +1575,7 @@ class AnthropicMessagesBackend:
         client = Anthropic()
         response = client.messages.create(
             model=self.model,
-            max_tokens=1024,
+            max_tokens=self.max_tokens or DEFAULT_COMPLETION_MAX_TOKENS,
             temperature=self.temperature,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
@@ -1583,7 +1602,7 @@ class AnthropicMessagesBackend:
             "step_name": step_name,
             "prompt_mode": prompt_mode,
             "temperature": self.temperature,
-            "max_tokens": 1024,
+            "max_tokens": self.max_tokens,
         }
 
     def drain_call_records(self) -> List[Dict[str, object]]:
@@ -1598,33 +1617,59 @@ def make_backend(
     *,
     timeout: float = 120.0,
     max_retries: int = 2,
+    max_tokens: int | None = DEFAULT_COMPLETION_MAX_TOKENS,
 ) -> ModelBackend:
     if provider == "stub":
         return StubModelBackend()
     if provider == "openai":
         if not model:
             raise ValueError("--model is required for provider=openai")
-        return OpenAIChatBackend(model=model, timeout=timeout, max_retries=max_retries)
+        return OpenAIChatBackend(
+            model=model,
+            timeout=timeout,
+            max_retries=max_retries,
+            max_tokens=max_tokens,
+        )
     if provider == "ollama":
         if not model:
             raise ValueError("--model is required for provider=ollama")
-        return OllamaChatBackend(model=model, timeout=timeout, max_retries=max_retries)
+        return OllamaChatBackend(
+            model=model,
+            timeout=timeout,
+            max_retries=max_retries,
+            max_tokens=max_tokens,
+        )
     if provider == "groq":
         if not model:
             raise ValueError("--model is required for provider=groq")
-        return GroqChatBackend(model=model, timeout=timeout, max_retries=max_retries)
+        return GroqChatBackend(
+            model=model,
+            timeout=timeout,
+            max_retries=max_retries,
+            max_tokens=max_tokens,
+        )
     if provider == "vllm":
         if not model:
             raise ValueError("--model is required for provider=vllm")
-        return VLLMServerChatBackend(model=model, timeout=timeout, max_retries=max_retries)
+        return VLLMServerChatBackend(
+            model=model,
+            timeout=timeout,
+            max_retries=max_retries,
+            max_tokens=max_tokens,
+        )
     if provider == "continuum":
         if not model:
             raise ValueError("--model is required for provider=continuum")
-        return ContinuumServerChatBackend(model=model, timeout=timeout, max_retries=max_retries)
+        return ContinuumServerChatBackend(
+            model=model,
+            timeout=timeout,
+            max_retries=max_retries,
+            max_tokens=max_tokens,
+        )
     if provider == "anthropic":
         if not model:
             raise ValueError("--model is required for provider=anthropic")
-        return AnthropicMessagesBackend(model=model)
+        return AnthropicMessagesBackend(model=model, max_tokens=max_tokens)
     raise ValueError(f"unsupported provider {provider!r}")
 
 

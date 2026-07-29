@@ -88,6 +88,12 @@ def parse_args():
         default=2,
         help="Maximum SDK retries for OpenAI-compatible backends.",
     )
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=1024,
+        help="Maximum completion tokens per backend request.",
+    )
     args = parser.parse_args()
     if not args.demo_instance and not args.instances_path:
         parser.error("Provide either --demo_instance or --instances_path.")
@@ -106,6 +112,7 @@ def main():
         args.model,
         timeout=args.request_timeout,
         max_retries=args.max_retries,
+        max_tokens=args.max_tokens,
     )
     runner = LangGraphTracedAgentRunner(
         backend=backend,

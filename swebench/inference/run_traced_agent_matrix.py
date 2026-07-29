@@ -93,6 +93,12 @@ def parse_args():
         help="Maximum SDK retries for OpenAI-compatible backends.",
     )
     parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=1024,
+        help="Maximum completion tokens per backend request.",
+    )
+    parser.add_argument(
         "--skip_analysis",
         action="store_true",
         help="Skip the combined analyzer pass.",
@@ -126,6 +132,7 @@ def main():
                 model,
                 timeout=args.request_timeout,
                 max_retries=args.max_retries,
+                max_tokens=args.max_tokens,
             )
             provider_trace_dir = traces_dir / label
             provider_trace_dir.mkdir(parents=True, exist_ok=True)

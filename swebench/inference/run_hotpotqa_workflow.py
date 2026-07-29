@@ -134,6 +134,7 @@ def parse_args():
     )
     parser.add_argument("--request_timeout", type=float, default=120.0)
     parser.add_argument("--max_retries", type=int, default=2)
+    parser.add_argument("--max_tokens", type=int, default=1024)
     parser.add_argument(
         "--hotpotqa_path",
         type=str,
@@ -172,6 +173,7 @@ def main():
         args.model,
         timeout=args.request_timeout,
         max_retries=args.max_retries,
+        max_tokens=args.max_tokens,
     )
     runner = HotpotQATracedAgentRunner(
         backend=backend,
