@@ -978,6 +978,9 @@ class StubModelBackend:
                 "iteration": iteration,
                 "step_name": step_name,
                 "prompt_mode": prompt_mode,
+                "model": getattr(self, "model", self.name),
+                "temperature": getattr(self, "temperature", 0.0),
+                "max_tokens": None,
                 "duration_ms": total_duration_ms,
                 "backend_roundtrip_ms": 0.0,
                 "frontend_message_build_ms": frontend_message_build_ms,
@@ -988,6 +991,11 @@ class StubModelBackend:
                 "prompt_tokens": prompt_metrics["prompt_tokens"],
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_metrics["prompt_tokens"] + completion_tokens,
+                "finish_reason": "stub",
+                "completion_text_excerpt": text[:1000],
+                "completion_text_length": len(text),
+                "effective_completion_tokens_per_second": None,
+                "raw_logging_enabled": False,
                 "segment_group_id": prompt_group.group_id if prompt_group is not None else None,
                 "segment_count": (
                     len(segment_request.ordered_segments) if segment_request is not None else 0
@@ -1316,6 +1324,14 @@ class VLLMServerChatBackend:
             time.perf_counter() - prompt_metrics_started_at
         ) * 1000.0
         total_duration_ms = (time.perf_counter() - call_started_at) * 1000.0
+        raw_request_logging = os.environ.get("SEGMENT_RUNTIME_LOG_RAW_REQUESTS") == "1"
+        completion_text_excerpt = result.text[:1000]
+        effective_tokens_per_second = None
+        if result.completion_tokens is not None and result.duration_ms > 0:
+            effective_tokens_per_second = result.completion_tokens / (result.duration_ms / 1000.0)
+        raw_messages = [
+            {"role": role, "content": content} for role, content in cached_messages
+        ]
         self._call_records.append(
             {
                 "request_id": (
@@ -1334,6 +1350,11 @@ class VLLMServerChatBackend:
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.completion_tokens,
                 "total_tokens": result.total_tokens,
+                "finish_reason": result.finish_reason,
+                "completion_text_excerpt": completion_text_excerpt,
+                "completion_text_length": len(result.text),
+                "effective_completion_tokens_per_second": effective_tokens_per_second,
+                "raw_logging_enabled": raw_request_logging,
                 "message_digest": result.message_digest,
                 "segment_group_id": prompt_group.group_id if prompt_group is not None else None,
                 "segment_count": (
@@ -1392,6 +1413,8 @@ class VLLMServerChatBackend:
                 "frontend_cache_hit": result.frontend_cache_hit,
                 "assembled_message_count": len(cached_messages),
                 "request_key": request_key,
+                "raw_messages": raw_messages if raw_request_logging else None,
+                "completion_text": result.text if raw_request_logging else None,
             }
         )
         return result.text

@@ -49,6 +49,7 @@ class VLLMCompletionResult:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    finish_reason: str | None = None
     frontend_cache_hit: bool = False
 
 
@@ -114,24 +115,28 @@ class OpenAICompatibleVLLMAdapter:
             response = client.chat.completions.create(**payload)
             duration_ms = (time.perf_counter() - started_at) * 1000.0
             usage = getattr(response, "usage", None)
+            choice = response.choices[0]
             return VLLMCompletionResult(
-                text=response.choices[0].message.content or "",
+                text=choice.message.content or "",
                 duration_ms=duration_ms,
                 message_digest=request.message_digest(),
                 prompt_tokens=getattr(usage, "prompt_tokens", None),
                 completion_tokens=getattr(usage, "completion_tokens", None),
                 total_tokens=getattr(usage, "total_tokens", None),
+                finish_reason=getattr(choice, "finish_reason", None),
                 frontend_cache_hit=bool(request.messages_override),
             )
         response = client.chat.completions.create(**payload)
         duration_ms = (time.perf_counter() - started_at) * 1000.0
         usage = getattr(response, "usage", None)
+        choice = response.choices[0]
         return VLLMCompletionResult(
-            text=response.choices[0].message.content or "",
+            text=choice.message.content or "",
             duration_ms=duration_ms,
             message_digest=request.message_digest(),
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
             total_tokens=getattr(usage, "total_tokens", None),
+            finish_reason=getattr(choice, "finish_reason", None),
             frontend_cache_hit=bool(request.messages_override),
         )
