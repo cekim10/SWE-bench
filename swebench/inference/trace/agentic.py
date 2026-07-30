@@ -395,6 +395,40 @@ def build_crewai_demo_instance() -> WorkflowInstance:
     )
 
 
+def build_autogen_demo_instance() -> WorkflowInstance:
+    return WorkflowInstance(
+        instance_id="autogen__demo-1",
+        problem_statement=(
+            "Design an AutoGen-style round-robin multi-agent workflow for investigating "
+            "a production latency regression and producing a remediation plan."
+        ),
+        file_contents={
+            "docs/round_robin_team.md": (
+                "AutoGen AgentChat supports teams such as RoundRobinGroupChat, where "
+                "assistant agents take turns and share conversational context. This pattern "
+                "is useful for planner-critic and researcher-writer workflows.\n"
+            ),
+            "docs/latency_regression.md": (
+                "A latency regression investigation needs stable incident context, evidence "
+                "from metrics, hypotheses about bottlenecks, and iterative critique. The "
+                "incident objective is long-lived while evidence and drafts evolve.\n"
+            ),
+            "docs/runtime_state.md": (
+                "Agent teams can save, load, and resume state. Serving runtimes should "
+                "distinguish stable team instructions from short-lived observations and "
+                "intermediate critiques.\n"
+            ),
+        },
+        readmes={
+            "README.md": (
+                "Treat each markdown file as shared context for an AutoGen-style agent team. "
+                "Preserve the stable incident objective while revising evidence, plans, and "
+                "final recommendations."
+            )
+        },
+    )
+
+
 def build_hotpotqa_demo_instance() -> WorkflowInstance:
     return WorkflowInstance(
         instance_id="hotpotqa__demo-1",
@@ -488,6 +522,15 @@ class CrewAIPromptPack:
     core_source_excerpt: str
 
 
+@dataclass(frozen=True)
+class AutoGenPromptPack:
+    repo_path: Path
+    readme_path: Path
+    readme_text: str
+    agents_guidance: str
+    core_source_excerpt: str
+
+
 def _default_open_deep_research_repo_path() -> Path | None:
     candidate = Path(__file__).resolve().parents[3] / ".external" / "open_deep_research"
     return candidate if candidate.exists() else None
@@ -527,6 +570,11 @@ def _default_hotpotqa_repo_path() -> Path | None:
 
 def _default_crewai_repo_path() -> Path | None:
     candidate = Path(__file__).resolve().parents[3] / ".external" / "crewai"
+    return candidate if candidate.exists() else None
+
+
+def _default_autogen_repo_path() -> Path | None:
+    candidate = Path(__file__).resolve().parents[3] / ".external" / "autogen"
     return candidate if candidate.exists() else None
 
 
@@ -970,6 +1018,125 @@ def _load_crewai_symbols(repo_path: Path) -> Mapping[str, object]:
         "import_paths": tuple(inserted_paths),
         "module_file": getattr(module, "__file__", None),
         "version": getattr(module, "__version__", None),
+    }
+
+
+def load_autogen_prompt_pack(
+    repo_path: str | Path | None = None,
+) -> AutoGenPromptPack:
+    resolved_repo_path = (
+        Path(repo_path).expanduser().resolve()
+        if repo_path is not None
+        else _default_autogen_repo_path()
+    )
+    if resolved_repo_path is None or not resolved_repo_path.exists():
+        raise RuntimeError(
+            "AutoGen repo not found. Clone microsoft/autogen and pass --autogen_path, "
+            "or place it at './.external/autogen'."
+        )
+
+    readme_path = resolved_repo_path / "README.md"
+    agentchat_package = (
+        resolved_repo_path
+        / "python"
+        / "packages"
+        / "autogen-agentchat"
+        / "src"
+        / "autogen_agentchat"
+    )
+    core_package = (
+        resolved_repo_path
+        / "python"
+        / "packages"
+        / "autogen-core"
+        / "src"
+        / "autogen_core"
+    )
+    if not readme_path.exists() or not agentchat_package.exists() or not core_package.exists():
+        raise RuntimeError(
+            f"{resolved_repo_path} does not look like a microsoft/autogen checkout"
+        )
+
+    agents_path = resolved_repo_path / "AGENTS.md"
+    source_candidates = [
+        agentchat_package / "agents" / "_assistant_agent.py",
+        agentchat_package / "agents" / "__init__.py",
+        agentchat_package / "teams" / "_group_chat" / "_round_robin_group_chat.py",
+        agentchat_package / "teams" / "__init__.py",
+        agentchat_package / "conditions" / "_terminations.py",
+        core_package / "__init__.py",
+    ]
+    source_parts: List[str] = []
+    for path in source_candidates:
+        if not path.exists() or path.is_dir():
+            continue
+        relative_path = path.relative_to(resolved_repo_path)
+        source_parts.append(
+            f"# {relative_path}\n"
+            f"{truncate_text(path.read_text(encoding='utf-8'), 1200)}"
+        )
+
+    return AutoGenPromptPack(
+        repo_path=resolved_repo_path,
+        readme_path=readme_path,
+        readme_text=readme_path.read_text(encoding="utf-8"),
+        agents_guidance=(
+            agents_path.read_text(encoding="utf-8")
+            if agents_path.exists()
+            else "AutoGen repository guidance file AGENTS.md was not present in this checkout."
+        ),
+        core_source_excerpt="\n\n".join(source_parts),
+    )
+
+
+def _load_autogen_symbols(repo_path: Path) -> Mapping[str, object]:
+    package_root = repo_path / "python" / "packages"
+    search_paths = [
+        package_root / "autogen-agentchat" / "src",
+        package_root / "autogen-core" / "src",
+        package_root / "autogen-ext" / "src",
+        repo_path,
+    ]
+    inserted_paths: List[str] = []
+    for path in search_paths:
+        if not path.exists():
+            continue
+        path_text = str(path)
+        if path_text in sys.path:
+            continue
+        sys.path.insert(0, path_text)
+        inserted_paths.append(path_text)
+
+    try:
+        agents_module = importlib.import_module("autogen_agentchat.agents")
+        teams_module = importlib.import_module("autogen_agentchat.teams")
+        conditions_module = importlib.import_module("autogen_agentchat.conditions")
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import official AutoGen packages from checkout. Install its "
+            "packages or run editable installs for autogen-core and autogen-agentchat."
+        ) from exc
+
+    missing = []
+    if not hasattr(agents_module, "AssistantAgent"):
+        missing.append("autogen_agentchat.agents.AssistantAgent")
+    if not hasattr(teams_module, "RoundRobinGroupChat"):
+        missing.append("autogen_agentchat.teams.RoundRobinGroupChat")
+    if not hasattr(conditions_module, "MaxMessageTermination"):
+        missing.append("autogen_agentchat.conditions.MaxMessageTermination")
+    if missing:
+        raise RuntimeError(
+            "Imported AutoGen package is missing expected public symbols: "
+            + ", ".join(sorted(missing))
+        )
+    return {
+        "AssistantAgent": getattr(agents_module, "AssistantAgent"),
+        "RoundRobinGroupChat": getattr(teams_module, "RoundRobinGroupChat"),
+        "MaxMessageTermination": getattr(conditions_module, "MaxMessageTermination"),
+        "agentchat_module_file": getattr(agents_module, "__file__", None),
+        "teams_module_file": getattr(teams_module, "__file__", None),
+        "conditions_module_file": getattr(conditions_module, "__file__", None),
+        "import_paths": tuple(inserted_paths),
     }
 
 
@@ -6000,6 +6167,212 @@ class CrewAITracedAgentRunner(DeepResearchTracedAgentRunner):
             f"Reviewer iteration: {iteration}\n"
             "Review the current artifact, identify missing evidence, and provide concise "
             "feedback for the next manager planning turn."
+        )
+
+
+class AutoGenTracedAgentRunner(DeepResearchTracedAgentRunner):
+    class _NoOpModelClient:
+        model_info = {
+            "vision": False,
+            "function_calling": False,
+            "json_output": False,
+            "family": "noop",
+        }
+
+        async def create(self, *args, **kwargs):
+            raise RuntimeError(
+                "AutoGen team.run is intentionally disabled; LLM calls use SegmentRuntime/vLLM."
+            )
+
+        async def create_stream(self, *args, **kwargs):
+            raise RuntimeError(
+                "AutoGen team.run is intentionally disabled; LLM calls use SegmentRuntime/vLLM."
+            )
+
+        async def close(self) -> None:
+            return None
+
+    def __init__(
+        self,
+        *,
+        backend: ModelBackend,
+        trace_dir: str | Path,
+        tenant_id: str = "local",
+        max_iterations: int = 2,
+        max_files: int = 5,
+        prompt_runtime_mode: str = "monolithic",
+        autogen_path: str | Path | None = None,
+    ) -> None:
+        super().__init__(
+            backend=backend,
+            trace_dir=trace_dir,
+            tenant_id=tenant_id,
+            max_iterations=max_iterations,
+            max_files=max_files,
+            prompt_runtime_mode=prompt_runtime_mode,
+        )
+        self._autogen_prompts = load_autogen_prompt_pack(autogen_path)
+        self._autogen_framework = _load_autogen_symbols(self._autogen_prompts.repo_path)
+        self._autogen_framework_summary = self._build_autogen_framework_skeleton()
+
+    def _research_agent_family_name(self) -> str:
+        return "autogen"
+
+    def _research_result_workload_metadata(self) -> Dict[str, object]:
+        return {
+            "workload_source": "autogen",
+            "autogen_path": str(self._autogen_prompts.repo_path),
+            "autogen_framework": self._autogen_framework_summary,
+        }
+
+    def _build_autogen_framework_skeleton(self) -> Dict[str, object]:
+        AssistantAgent = self._autogen_framework["AssistantAgent"]
+        RoundRobinGroupChat = self._autogen_framework["RoundRobinGroupChat"]
+        MaxMessageTermination = self._autogen_framework["MaxMessageTermination"]
+        model_client = self._NoOpModelClient()
+
+        planner = AssistantAgent(
+            "planner",
+            model_client=model_client,
+            system_message=(
+                "You preserve stable incident context and produce a short investigation plan."
+            ),
+        )
+        researcher = AssistantAgent(
+            "researcher",
+            model_client=model_client,
+            system_message="You extract reusable evidence for the team.",
+        )
+        writer = AssistantAgent(
+            "writer",
+            model_client=model_client,
+            system_message="You draft the current remediation artifact.",
+        )
+        critic = AssistantAgent(
+            "critic",
+            model_client=model_client,
+            system_message="You critique the artifact and decide what context should persist.",
+        )
+        termination = MaxMessageTermination(max_messages=4)
+        team = RoundRobinGroupChat(
+            [planner, researcher, writer, critic],
+            termination_condition=termination,
+        )
+        participants = getattr(team, "_participants", None) or getattr(team, "participants", None) or []
+        return {
+            "source": "official_autogen",
+            "agentchat_module_file": self._autogen_framework.get("agentchat_module_file"),
+            "teams_module_file": self._autogen_framework.get("teams_module_file"),
+            "conditions_module_file": self._autogen_framework.get("conditions_module_file"),
+            "assistant_agent_class": (
+                f"{AssistantAgent.__module__}.{AssistantAgent.__name__}"
+            ),
+            "team_class": (
+                f"{RoundRobinGroupChat.__module__}.{RoundRobinGroupChat.__name__}"
+            ),
+            "termination_class": (
+                f"{MaxMessageTermination.__module__}.{MaxMessageTermination.__name__}"
+            ),
+            "participant_count": len(participants) if participants else 4,
+            "team_run_executed": False,
+            "team_run_note": (
+                "AutoGen AgentChat objects are instantiated from the official framework, "
+                "but team.run is not called so LLM requests remain on the instrumented "
+                "SegmentRuntime/vLLM path."
+            ),
+        }
+
+    def _autogen_repo_excerpt(self) -> str:
+        readme_excerpt = truncate_text(
+            self._autogen_prompts.readme_text.strip().replace("\r\n", "\n"),
+            1300,
+        )
+        agents_excerpt = truncate_text(
+            self._autogen_prompts.agents_guidance.strip().replace("\r\n", "\n"),
+            600,
+        )
+        source_excerpt = truncate_text(
+            self._autogen_prompts.core_source_excerpt.strip().replace("\r\n", "\n"),
+            1300,
+        )
+        parts = [readme_excerpt]
+        if agents_excerpt:
+            parts.append(f"Repository guidance:\n{agents_excerpt}")
+        if source_excerpt:
+            parts.append(f"Core AutoGen abstractions:\n{source_excerpt}")
+        return "\n\n".join(part for part in parts if part)
+
+    def _research_planner_system_prompt(self) -> str:
+        return (
+            "You are an AutoGen AgentChat planner in a round-robin multi-agent team. "
+            "Preserve stable task context and coordinate specialist agents.\n\n"
+            f"{self._autogen_repo_excerpt()}"
+        )
+
+    def _research_planner_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Team objective:\n{instance.problem_statement}\n\n"
+            f"Planner turn: {iteration}\n"
+            "Create or revise the team plan using the active task, evidence, notes, "
+            "and critic feedback segments."
+        )
+
+    def _research_reader_system_prompt(self) -> str:
+        return (
+            "You are an AutoGen researcher agent. Extract evidence that should remain "
+            "available to the round-robin team."
+        )
+
+    def _research_reader_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+        source_name: str,
+    ) -> str:
+        return (
+            f"Team objective:\n{instance.problem_statement}\n\n"
+            f"Focused evidence: {source_name}\n"
+            f"Researcher turn: {iteration}\n"
+            "Summarize reusable evidence and identify which team participant should use it."
+        )
+
+    def _research_writer_system_prompt(self) -> str:
+        return (
+            "You are an AutoGen writer agent. Draft the current artifact from the active "
+            "plan and team memory without repeating stable instructions."
+        )
+
+    def _research_writer_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Team objective:\n{instance.problem_statement}\n\n"
+            f"Writer turn: {iteration}\n"
+            "Use the active plan and evidence summaries to produce or revise the artifact."
+        )
+
+    def _research_critic_system_prompt(self) -> str:
+        return (
+            "You are an AutoGen critic agent. Review the artifact and provide feedback "
+            "for the next round-robin planning turn."
+        )
+
+    def _research_critic_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Team objective:\n{instance.problem_statement}\n\n"
+            f"Critic turn: {iteration}\n"
+            "Review the artifact against the stable objective and active evidence. "
+            "Identify missing context and what should persist into the next turn."
         )
 
 

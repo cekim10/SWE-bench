@@ -638,6 +638,149 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 )
             )
 
+    def test_load_autogen_prompt_pack_from_repo_checkout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "autogen"
+            agentchat = (
+                repo_root
+                / "python"
+                / "packages"
+                / "autogen-agentchat"
+                / "src"
+                / "autogen_agentchat"
+            )
+            core = (
+                repo_root
+                / "python"
+                / "packages"
+                / "autogen-core"
+                / "src"
+                / "autogen_core"
+            )
+            (agentchat / "agents").mkdir(parents=True, exist_ok=True)
+            (agentchat / "teams" / "_group_chat").mkdir(parents=True, exist_ok=True)
+            (agentchat / "conditions").mkdir(parents=True, exist_ok=True)
+            core.mkdir(parents=True, exist_ok=True)
+            (repo_root / "README.md").write_text(
+                "UPSTREAM_AUTOGEN_README\n\nBuild AgentChat teams.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text(
+                "UPSTREAM_AUTOGEN_GUIDE\n\nPreserve team state.\n",
+                encoding="utf-8",
+            )
+            (agentchat / "agents" / "_assistant_agent.py").write_text(
+                "class AssistantAgent:\n    pass\n",
+                encoding="utf-8",
+            )
+            (agentchat / "teams" / "_group_chat" / "_round_robin_group_chat.py").write_text(
+                "class RoundRobinGroupChat:\n    pass\n",
+                encoding="utf-8",
+            )
+            (agentchat / "conditions" / "_terminations.py").write_text(
+                "class MaxMessageTermination:\n    pass\n",
+                encoding="utf-8",
+            )
+            (core / "__init__.py").write_text("", encoding="utf-8")
+
+            prompt_pack = AGENTIC.load_autogen_prompt_pack(repo_root)
+            self.assertEqual(prompt_pack.repo_path, repo_root.resolve())
+            self.assertIn("UPSTREAM_AUTOGEN_README", prompt_pack.readme_text)
+            self.assertIn("UPSTREAM_AUTOGEN_GUIDE", prompt_pack.agents_guidance)
+            self.assertIn("AssistantAgent", prompt_pack.core_source_excerpt)
+
+    def test_autogen_runner_uses_official_framework_objects(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "autogen"
+            agentchat = (
+                repo_root
+                / "python"
+                / "packages"
+                / "autogen-agentchat"
+                / "src"
+                / "autogen_agentchat"
+            )
+            core = (
+                repo_root
+                / "python"
+                / "packages"
+                / "autogen-core"
+                / "src"
+                / "autogen_core"
+            )
+            (agentchat / "agents").mkdir(parents=True, exist_ok=True)
+            (agentchat / "teams").mkdir(parents=True, exist_ok=True)
+            (agentchat / "conditions").mkdir(parents=True, exist_ok=True)
+            core.mkdir(parents=True, exist_ok=True)
+            (repo_root / "README.md").write_text(
+                "UPSTREAM_AUTOGEN_README\n\nBuild AgentChat teams.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text(
+                "UPSTREAM_AUTOGEN_GUIDE\n\nPreserve team state.\n",
+                encoding="utf-8",
+            )
+            (agentchat / "__init__.py").write_text("", encoding="utf-8")
+            (agentchat / "agents" / "__init__.py").write_text(
+                dedent(
+                    """
+                    class AssistantAgent:
+                        def __init__(self, name, model_client=None, system_message=None, **kwargs):
+                            self.name = name
+                            self.model_client = model_client
+                            self.system_message = system_message
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (agentchat / "teams" / "__init__.py").write_text(
+                dedent(
+                    """
+                    class RoundRobinGroupChat:
+                        def __init__(self, participants, termination_condition=None, **kwargs):
+                            self.participants = participants
+                            self.termination_condition = termination_condition
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (agentchat / "conditions" / "__init__.py").write_text(
+                dedent(
+                    """
+                    class MaxMessageTermination:
+                        def __init__(self, max_messages):
+                            self.max_messages = max_messages
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (core / "__init__.py").write_text("", encoding="utf-8")
+
+            backend = self.CapturingBackend()
+            runner = AGENTIC.AutoGenTracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=3,
+                prompt_runtime_mode="segment_aware",
+                autogen_path=repo_root,
+            )
+            result = runner.run_instance(AGENTIC.build_autogen_demo_instance())
+            self.assertEqual(result["agent_family"], "autogen")
+            self.assertEqual(result["workload_source"], "autogen")
+            self.assertEqual(Path(result["autogen_path"]), repo_root.resolve())
+            self.assertEqual(result["autogen_framework"]["source"], "official_autogen")
+            self.assertEqual(result["autogen_framework"]["participant_count"], 4)
+            self.assertFalse(result["autogen_framework"]["team_run_executed"])
+            self.assertGreater(len(backend.calls), 0)
+            self.assertTrue(
+                any(
+                    "UPSTREAM_AUTOGEN_README" in call.get("system_prompt", "")
+                    for call in backend.calls
+                )
+            )
+
     def test_hotpotqa_example_loader_converts_official_style_examples(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             examples_path = Path(tmpdir) / "hotpot_examples.json"
