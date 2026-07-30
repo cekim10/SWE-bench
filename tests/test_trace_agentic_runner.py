@@ -511,6 +511,133 @@ class TraceAgenticRunnerTests(unittest.TestCase):
                 )
             )
 
+    def test_load_crewai_prompt_pack_from_repo_checkout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "crewai"
+            source_dir = repo_root / "src" / "crewai"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "README.md").write_text(
+                "UPSTREAM_CREWAI_README\n\nBuild crews with agents and tasks.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text(
+                "UPSTREAM_CREWAI_GUIDE\n\nPreserve crew roles.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "pyproject.toml").write_text(
+                "[project]\nname = \"crewai\"\n",
+                encoding="utf-8",
+            )
+            (source_dir / "__init__.py").write_text(
+                dedent(
+                    """
+                    class Agent:
+                        def __init__(self, **kwargs):
+                            self.__dict__.update(kwargs)
+
+                    class Task:
+                        def __init__(self, **kwargs):
+                            self.__dict__.update(kwargs)
+
+                    class Crew:
+                        def __init__(self, agents=None, tasks=None, **kwargs):
+                            self.agents = agents or []
+                            self.tasks = tasks or []
+
+                    class Process:
+                        sequential = "sequential"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (source_dir / "agent.py").write_text(
+                "class Agent:\n    pass\n",
+                encoding="utf-8",
+            )
+            (source_dir / "crew.py").write_text(
+                "class Crew:\n    pass\n",
+                encoding="utf-8",
+            )
+
+            prompt_pack = AGENTIC.load_crewai_prompt_pack(repo_root)
+            self.assertEqual(prompt_pack.repo_path, repo_root.resolve())
+            self.assertIn("UPSTREAM_CREWAI_README", prompt_pack.readme_text)
+            self.assertIn("UPSTREAM_CREWAI_GUIDE", prompt_pack.agents_guidance)
+            self.assertIn("class Agent", prompt_pack.core_source_excerpt)
+
+    def test_crewai_runner_uses_upstream_prompt_pack(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "crewai"
+            source_dir = repo_root / "src" / "crewai"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            (repo_root / "README.md").write_text(
+                "UPSTREAM_CREWAI_README\n\nBuild crews with agents and tasks.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "AGENTS.md").write_text(
+                "UPSTREAM_CREWAI_GUIDE\n\nPreserve crew roles.\n",
+                encoding="utf-8",
+            )
+            (repo_root / "pyproject.toml").write_text(
+                "[project]\nname = \"crewai\"\n",
+                encoding="utf-8",
+            )
+            (source_dir / "__init__.py").write_text(
+                dedent(
+                    """
+                    class Agent:
+                        def __init__(self, **kwargs):
+                            self.__dict__.update(kwargs)
+
+                    class Task:
+                        def __init__(self, **kwargs):
+                            self.__dict__.update(kwargs)
+
+                    class Crew:
+                        def __init__(self, agents=None, tasks=None, **kwargs):
+                            self.agents = agents or []
+                            self.tasks = tasks or []
+
+                    class Process:
+                        sequential = "sequential"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (source_dir / "agent.py").write_text(
+                "class Agent:\n    pass\n",
+                encoding="utf-8",
+            )
+            (source_dir / "task.py").write_text(
+                "class Task:\n    pass\n",
+                encoding="utf-8",
+            )
+
+            backend = self.CapturingBackend()
+            runner = AGENTIC.CrewAITracedAgentRunner(
+                backend=backend,
+                trace_dir=Path(tmpdir) / "traces",
+                tenant_id="test-tenant",
+                max_iterations=2,
+                max_files=3,
+                prompt_runtime_mode="segment_aware",
+                crewai_path=repo_root,
+            )
+            result = runner.run_instance(AGENTIC.build_crewai_demo_instance())
+            self.assertEqual(result["agent_family"], "crewai")
+            self.assertEqual(result["workload_source"], "crewai")
+            self.assertEqual(Path(result["crewai_path"]), repo_root.resolve())
+            self.assertEqual(result["crewai_framework"]["source"], "official_crewai")
+            self.assertEqual(result["crewai_framework"]["agent_count"], 4)
+            self.assertEqual(result["crewai_framework"]["task_count"], 4)
+            self.assertGreater(len(backend.calls), 0)
+            self.assertTrue(
+                any(
+                    "UPSTREAM_CREWAI_README" in call.get("system_prompt", "")
+                    for call in backend.calls
+                )
+            )
+
     def test_hotpotqa_example_loader_converts_official_style_examples(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             examples_path = Path(tmpdir) / "hotpot_examples.json"

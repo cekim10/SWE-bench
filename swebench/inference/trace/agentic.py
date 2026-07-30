@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
+import importlib
 import json
 import importlib.util
 import math
 import os
 import re
+import sys
 import time
 from hashlib import sha256
 from dataclasses import dataclass, field
@@ -359,6 +361,40 @@ def build_gaia_demo_instance() -> WorkflowInstance:
     )
 
 
+def build_crewai_demo_instance() -> WorkflowInstance:
+    return WorkflowInstance(
+        instance_id="crewai__demo-1",
+        problem_statement=(
+            "Design a CrewAI-style multi-agent workflow for triaging flaky tests, "
+            "assigning specialist agents, and producing a final remediation report."
+        ),
+        file_contents={
+            "docs/crew_orchestration.md": (
+                "CrewAI workflows organize work through crews of role-specialized agents. "
+                "A manager coordinates task delegation, while researchers, engineers, and "
+                "reviewers exchange intermediate outputs across multiple turns.\n"
+            ),
+            "docs/flaky_test_triage.md": (
+                "Flaky test triage requires stable task instructions, evidence from logs, "
+                "hypotheses about nondeterminism, and iterative validation. Evidence grows "
+                "over time while the manager objective remains stable.\n"
+            ),
+            "docs/runtime_tradeoffs.md": (
+                "Repeated multi-agent turns can repeatedly carry the same role definitions, "
+                "task brief, plan, and accumulated evidence. Segment-aware materialization "
+                "can expose which context is stable and which context should be refreshed.\n"
+            ),
+        },
+        readmes={
+            "README.md": (
+                "Treat each markdown file as context available to a CrewAI-style crew. "
+                "Preserve the manager objective, assign specialist roles, and revise the "
+                "final report across iterations."
+            )
+        },
+    )
+
+
 def build_hotpotqa_demo_instance() -> WorkflowInstance:
     return WorkflowInstance(
         instance_id="hotpotqa__demo-1",
@@ -443,6 +479,15 @@ class HotpotQAPromptPack:
     readme_text: str
 
 
+@dataclass(frozen=True)
+class CrewAIPromptPack:
+    repo_path: Path
+    readme_path: Path
+    readme_text: str
+    agents_guidance: str
+    core_source_excerpt: str
+
+
 def _default_open_deep_research_repo_path() -> Path | None:
     candidate = Path(__file__).resolve().parents[3] / ".external" / "open_deep_research"
     return candidate if candidate.exists() else None
@@ -478,6 +523,11 @@ def _default_hotpotqa_repo_path() -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def _default_crewai_repo_path() -> Path | None:
+    candidate = Path(__file__).resolve().parents[3] / ".external" / "crewai"
+    return candidate if candidate.exists() else None
 
 
 def _extract_yaml_block_scalar(source: str, key: str) -> str:
@@ -803,6 +853,113 @@ def load_hotpotqa_prompt_pack(
         readme_path=readme_path,
         readme_text=readme_path.read_text(encoding="utf-8"),
     )
+
+
+def load_crewai_prompt_pack(
+    repo_path: str | Path | None = None,
+) -> CrewAIPromptPack:
+    resolved_repo_path = (
+        Path(repo_path).expanduser().resolve()
+        if repo_path is not None
+        else _default_crewai_repo_path()
+    )
+    if resolved_repo_path is None or not resolved_repo_path.exists():
+        raise RuntimeError(
+            "CrewAI repo not found. Clone crewaiinc/crewai and pass --crewai_path, "
+            "or place it at './.external/crewai'."
+        )
+
+    readme_path = resolved_repo_path / "README.md"
+    pyproject_path = resolved_repo_path / "pyproject.toml"
+    package_candidates = [
+        resolved_repo_path / "src" / "crewai",
+        resolved_repo_path / "crewai",
+    ]
+    if (
+        not readme_path.exists()
+        or not pyproject_path.exists()
+        or not any(path.exists() for path in package_candidates)
+    ):
+        raise RuntimeError(
+            f"{resolved_repo_path} does not look like a crewaiinc/crewai checkout"
+        )
+
+    agents_path = resolved_repo_path / "AGENTS.md"
+    source_candidates = [
+        resolved_repo_path / "src" / "crewai" / "agent.py",
+        resolved_repo_path / "src" / "crewai" / "crew.py",
+        resolved_repo_path / "src" / "crewai" / "task.py",
+        resolved_repo_path / "src" / "crewai" / "flow" / "flow.py",
+        resolved_repo_path / "crewai" / "agent.py",
+        resolved_repo_path / "crewai" / "crew.py",
+        resolved_repo_path / "crewai" / "task.py",
+    ]
+    source_parts: List[str] = []
+    for path in source_candidates:
+        if not path.exists() or path.is_dir():
+            continue
+        relative_path = path.relative_to(resolved_repo_path)
+        source_parts.append(
+            f"# {relative_path}\n"
+            f"{truncate_text(path.read_text(encoding='utf-8'), 1200)}"
+        )
+
+    return CrewAIPromptPack(
+        repo_path=resolved_repo_path,
+        readme_path=readme_path,
+        readme_text=readme_path.read_text(encoding="utf-8"),
+        agents_guidance=(
+            agents_path.read_text(encoding="utf-8")
+            if agents_path.exists()
+            else "CrewAI repository guidance file AGENTS.md was not present in this checkout."
+        ),
+        core_source_excerpt="\n\n".join(source_parts),
+    )
+
+
+def _load_crewai_symbols(repo_path: Path) -> Mapping[str, object]:
+    search_paths = [
+        repo_path / "src",
+        repo_path,
+    ]
+    inserted_paths: List[str] = []
+    for path in search_paths:
+        if not path.exists():
+            continue
+        path_text = str(path)
+        if path_text in sys.path:
+            continue
+        sys.path.insert(0, path_text)
+        inserted_paths.append(path_text)
+
+    try:
+        module = importlib.import_module("crewai")
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import official CrewAI package from checkout. Install its "
+            "dependencies or run `uv pip install -e .external/crewai` on the GPU server."
+        ) from exc
+
+    missing = [
+        name
+        for name in ("Agent", "Task", "Crew", "Process")
+        if not hasattr(module, name)
+    ]
+    if missing:
+        raise RuntimeError(
+            "Imported CrewAI package is missing expected public symbols: "
+            + ", ".join(sorted(missing))
+        )
+    return {
+        "module": module,
+        "Agent": getattr(module, "Agent"),
+        "Task": getattr(module, "Task"),
+        "Crew": getattr(module, "Crew"),
+        "Process": getattr(module, "Process"),
+        "import_paths": tuple(inserted_paths),
+        "module_file": getattr(module, "__file__", None),
+        "version": getattr(module, "__version__", None),
+    }
 
 
 class ModelBackend(Protocol):
@@ -5617,6 +5774,221 @@ class HotpotQATracedAgentRunner(DeepResearchTracedAgentRunner):
             f"{reference_line}"
             f"Verification iteration: {iteration}\n"
             "Evaluate whether the candidate answer follows from the active multi-hop evidence."
+        )
+
+
+class CrewAITracedAgentRunner(DeepResearchTracedAgentRunner):
+    def __init__(
+        self,
+        *,
+        backend: ModelBackend,
+        trace_dir: str | Path,
+        tenant_id: str = "local",
+        max_iterations: int = 2,
+        max_files: int = 5,
+        prompt_runtime_mode: str = "monolithic",
+        crewai_path: str | Path | None = None,
+    ) -> None:
+        super().__init__(
+            backend=backend,
+            trace_dir=trace_dir,
+            tenant_id=tenant_id,
+            max_iterations=max_iterations,
+            max_files=max_files,
+            prompt_runtime_mode=prompt_runtime_mode,
+        )
+        self._crewai_prompts = load_crewai_prompt_pack(crewai_path)
+        self._crewai_framework = _load_crewai_symbols(self._crewai_prompts.repo_path)
+        self._crewai_framework_summary = self._build_crewai_framework_skeleton()
+
+    def _research_agent_family_name(self) -> str:
+        return "crewai"
+
+    def _research_result_workload_metadata(self) -> Dict[str, object]:
+        return {
+            "workload_source": "crewai",
+            "crewai_path": str(self._crewai_prompts.repo_path),
+            "crewai_framework": self._crewai_framework_summary,
+        }
+
+    def _build_crewai_framework_skeleton(self) -> Dict[str, object]:
+        Agent = self._crewai_framework["Agent"]
+        Task = self._crewai_framework["Task"]
+        Crew = self._crewai_framework["Crew"]
+        Process = self._crewai_framework["Process"]
+
+        manager = Agent(
+            role="Crew manager",
+            goal="Coordinate specialist agents while preserving the stable crew objective.",
+            backstory=(
+                "You maintain long-lived crew instructions and delegate work through "
+                "explicit task handoffs."
+            ),
+            allow_delegation=True,
+            verbose=False,
+        )
+        researcher = Agent(
+            role="Researcher",
+            goal="Extract reusable evidence for downstream crew members.",
+            backstory="You convert raw context into compact crew memory.",
+            allow_delegation=False,
+            verbose=False,
+        )
+        worker = Agent(
+            role="Worker",
+            goal="Produce the current artifact from the active plan and evidence.",
+            backstory="You execute assigned CrewAI tasks without restating stable context.",
+            allow_delegation=False,
+            verbose=False,
+        )
+        reviewer = Agent(
+            role="Reviewer",
+            goal="Review artifacts and produce feedback for the next manager turn.",
+            backstory="You identify missing evidence and task-progress gaps.",
+            allow_delegation=False,
+            verbose=False,
+        )
+
+        tasks = [
+            Task(
+                description="Plan the crew workflow and assign specialist responsibilities.",
+                expected_output="A concise manager plan.",
+                agent=manager,
+            ),
+            Task(
+                description="Read the focused evidence and extract reusable facts.",
+                expected_output="Reusable evidence notes.",
+                agent=researcher,
+            ),
+            Task(
+                description="Produce the current crew artifact from active context.",
+                expected_output="A draft artifact.",
+                agent=worker,
+            ),
+            Task(
+                description="Review the artifact and provide feedback.",
+                expected_output="Review feedback.",
+                agent=reviewer,
+            ),
+        ]
+        process = getattr(Process, "sequential", None) or getattr(Process, "hierarchical", None)
+        crew_kwargs: Dict[str, object] = {
+            "agents": [manager, researcher, worker, reviewer],
+            "tasks": tasks,
+            "verbose": False,
+        }
+        if process is not None:
+            crew_kwargs["process"] = process
+        crew = Crew(**crew_kwargs)
+        return {
+            "source": "official_crewai",
+            "module_file": self._crewai_framework.get("module_file"),
+            "version": self._crewai_framework.get("version"),
+            "agent_class": f"{Agent.__module__}.{Agent.__name__}",
+            "task_class": f"{Task.__module__}.{Task.__name__}",
+            "crew_class": f"{Crew.__module__}.{Crew.__name__}",
+            "process_class": f"{Process.__module__}.{Process.__name__}",
+            "agent_count": len(getattr(crew, "agents", []) or []),
+            "task_count": len(getattr(crew, "tasks", []) or []),
+            "kickoff_executed": False,
+            "kickoff_note": (
+                "CrewAI objects are instantiated from the official framework, but kickoff is "
+                "not called so LLM requests remain on the instrumented SegmentRuntime/vLLM path."
+            ),
+        }
+
+    def _crewai_repo_excerpt(self) -> str:
+        readme_excerpt = truncate_text(
+            self._crewai_prompts.readme_text.strip().replace("\r\n", "\n"),
+            1400,
+        )
+        agents_excerpt = truncate_text(
+            self._crewai_prompts.agents_guidance.strip().replace("\r\n", "\n"),
+            700,
+        )
+        source_excerpt = truncate_text(
+            self._crewai_prompts.core_source_excerpt.strip().replace("\r\n", "\n"),
+            1200,
+        )
+        parts = [readme_excerpt]
+        if agents_excerpt:
+            parts.append(f"Repository guidance:\n{agents_excerpt}")
+        if source_excerpt:
+            parts.append(f"Core CrewAI abstractions:\n{source_excerpt}")
+        return "\n\n".join(part for part in parts if part)
+
+    def _research_planner_system_prompt(self) -> str:
+        return (
+            "You are a CrewAI-style crew manager. Coordinate role-specialized agents, "
+            "preserve stable crew objectives, and delegate work through explicit tasks.\n\n"
+            f"{self._crewai_repo_excerpt()}"
+        )
+
+    def _research_planner_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Crew objective:\n{instance.problem_statement}\n\n"
+            f"Manager planning iteration: {iteration}\n"
+            "Define or revise the crew plan using the active task, evidence, notes, and "
+            "prior critique segments. Keep the manager objective stable across turns."
+        )
+
+    def _research_reader_system_prompt(self) -> str:
+        return (
+            "You are a CrewAI researcher agent. Read the focused evidence segment and "
+            "extract reusable facts for the crew manager and downstream agents."
+        )
+
+    def _research_reader_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+        source_name: str,
+    ) -> str:
+        return (
+            f"Crew objective:\n{instance.problem_statement}\n\n"
+            f"Focused evidence: {source_name}\n"
+            f"Researcher iteration: {iteration}\n"
+            "Summarize facts that should persist as crew memory and identify which "
+            "specialist agent should consume them."
+        )
+
+    def _research_writer_system_prompt(self) -> str:
+        return (
+            "You are a CrewAI worker agent. Execute the active manager plan and produce "
+            "the next artifact without restating stable crew instructions."
+        )
+
+    def _research_writer_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Crew objective:\n{instance.problem_statement}\n\n"
+            f"Worker iteration: {iteration}\n"
+            "Use the active plan and researcher notes to produce or revise the crew output."
+        )
+
+    def _research_critic_system_prompt(self) -> str:
+        return (
+            "You are a CrewAI reviewer agent. Evaluate the artifact against the manager "
+            "plan, active evidence, and task objective."
+        )
+
+    def _research_critic_user_prompt(
+        self,
+        instance: WorkflowInstance,
+        iteration: int,
+    ) -> str:
+        return (
+            f"Crew objective:\n{instance.problem_statement}\n\n"
+            f"Reviewer iteration: {iteration}\n"
+            "Review the current artifact, identify missing evidence, and provide concise "
+            "feedback for the next manager planning turn."
         )
 
 
