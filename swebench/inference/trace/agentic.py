@@ -872,6 +872,8 @@ def load_crewai_prompt_pack(
     readme_path = resolved_repo_path / "README.md"
     pyproject_path = resolved_repo_path / "pyproject.toml"
     package_candidates = [
+        resolved_repo_path / "lib" / "crewai" / "src" / "crewai",
+        resolved_repo_path / "lib" / "crewai" / "crewai",
         resolved_repo_path / "src" / "crewai",
         resolved_repo_path / "crewai",
     ]
@@ -886,6 +888,13 @@ def load_crewai_prompt_pack(
 
     agents_path = resolved_repo_path / "AGENTS.md"
     source_candidates = [
+        resolved_repo_path / "lib" / "crewai" / "src" / "crewai" / "agent.py",
+        resolved_repo_path / "lib" / "crewai" / "src" / "crewai" / "crew.py",
+        resolved_repo_path / "lib" / "crewai" / "src" / "crewai" / "task.py",
+        resolved_repo_path / "lib" / "crewai" / "src" / "crewai" / "flow" / "flow.py",
+        resolved_repo_path / "lib" / "crewai" / "crewai" / "agent.py",
+        resolved_repo_path / "lib" / "crewai" / "crewai" / "crew.py",
+        resolved_repo_path / "lib" / "crewai" / "crewai" / "task.py",
         resolved_repo_path / "src" / "crewai" / "agent.py",
         resolved_repo_path / "src" / "crewai" / "crew.py",
         resolved_repo_path / "src" / "crewai" / "task.py",
@@ -919,6 +928,8 @@ def load_crewai_prompt_pack(
 
 def _load_crewai_symbols(repo_path: Path) -> Mapping[str, object]:
     search_paths = [
+        repo_path / "lib" / "crewai" / "src",
+        repo_path / "lib" / "crewai",
         repo_path / "src",
         repo_path,
     ]
